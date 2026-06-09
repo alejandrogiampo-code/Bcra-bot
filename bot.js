@@ -1,13 +1,13 @@
 const TelegramBot = require("node-telegram-bot-api");
-const AdmZip = require("adm-zip");
-const cron = require("node-cron");
-const Database = require("better-sqlite3");
+const puppeteer   = require("puppeteer");
+const cron        = require("node-cron");
 
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) { console.error("Falta BOT_TOKEN"); process.exit(1); }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
+// ── Lista blanca ──────────────────────────────────────────────────────────────
 const ALLOWED_USERS = process.env.ALLOWED_USERS
   ? new Set(process.env.ALLOWED_USERS.split(",").map(id => id.trim()))
   : null;
@@ -17,221 +17,164 @@ function usuarioAutorizado(msg) {
 }
 function rechazarAcceso(chatId) { bot.sendMessage(chatId, "🔒 No tenes acceso."); }
 
+function parseCuit(v) { return v.replace(/\D/g, ""); }
+function formatCuit(c) {
+  return c.length===11 ? c.slice(0,2)+"-"+c.slice(2,10)+"-"+c.slice(10) : c;
+}
+function formatMonto(m) {
+  return "$" + Number(m).toLocaleString("es-AR", {minimumFractionDigits:2});
+}
+
 const SITS = {
   1:{emoji:"🟢",label:"Normal"},2:{emoji:"🟡",label:"Riesgo bajo"},
   3:{emoji:"🟠",label:"Riesgo medio"},4:{emoji:"🔴",label:"Riesgo alto"},
   5:{emoji:"⛔",label:"Irrecuperable"},6:{emoji:"🔵",label:"Irrecup. Tecnica"},
 };
 
-const DIAS = parseInt(process.env.DIAS_HISTORICO || "30");
-const DB_PATH = process.env.DB_PATH || "/tmp/bcra.db";
-const db = new Database(DB_PATH);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS cheques (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cuit TEXT NOT NULL,
-    banco TEXT,
-    fecha_pres TEXT,
-    monto REAL,
-    fecha_rec TEXT,
-    causal TEXT,
-    pagado INTEGER DEFAULT 0,
-    fecha_pago TEXT,
-    UNIQUE(cuit, banco, fecha_pres, monto)
-  );
-  CREATE INDEX IF NOT EXISTS idx_cuit ON cheques(cuit);
-  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-`);
-
-const stmtInsert = db.prepare(`
-  INSERT OR IGNORE INTO cheques (cuit,banco,fecha_pres,monto,fecha_rec,causal,pagado,fecha_pago)
-  VALUES (@cuit,@banco,@fecha_pres,@monto,@fecha_rec,@causal,@pagado,@fecha_pago)
-`);
-const stmtPagar = db.prepare(`
-  UPDATE cheques SET pagado=1,fecha_pago=@fecha_pago
-  WHERE cuit=@cuit AND banco=@banco AND fecha_pres=@fecha_pres AND ABS(monto-@monto)<1
-`);
-const stmtQuery  = db.prepare(`SELECT * FROM cheques WHERE cuit=? ORDER BY fecha_pres DESC`);
-const stmtCount  = db.prepare(`SELECT COUNT(*) as n FROM cheques`);
-const stmtCuits  = db.prepare(`SELECT COUNT(DISTINCT cuit) as n FROM cheques`);
-const batchIns   = db.transaction(rows => { for(const r of rows) stmtInsert.run(r); });
-const batchPag   = db.transaction(rows => { for(const r of rows) stmtPagar.run(r); });
-
-let ultimaAct = db.prepare(`SELECT value FROM meta WHERE key='ultima_act'`).get()?.value || null;
-let estadoBase = "iniciando";
-let muestraDebug = null;
-
-function parseCuit(v) { return v.replace(/\D/g,""); }
-function formatCuit(c) { return c.length===11 ? c.slice(0,2)+"-"+c.slice(2,10)+"-"+c.slice(10) : c; }
-function formatMonto(m) { return "$"+Number(m).toLocaleString("es-AR",{minimumFractionDigits:2}); }
-function fmtFechaYMD(f) {
-  // AAAAMMDD -> DD/MM/AAAA
-  if (f && f.length===8 && /^\d{8}$/.test(f))
-    return f.slice(6,8)+"/"+f.slice(4,6)+"/"+f.slice(0,4);
-  return f||"-";
-}
-
-async function fetchJSON(url) {
-  const c=new AbortController(), t=setTimeout(()=>c.abort(),15000);
+// ── Scraping BCRA ─────────────────────────────────────────────────────────────
+async function scrapearBCRA(cuit) {
+  let browser;
   try {
-    const r=await fetch(url,{signal:c.signal,headers:{Accept:"application/json","User-Agent":"Mozilla/5.0"}});
-    clearTimeout(t); if(!r.ok) return null; return await r.json();
-  } catch(e){clearTimeout(t);return null;}
-}
-async function fetchZip(url) {
-  const c=new AbortController(), t=setTimeout(()=>c.abort(),30000);
-  try {
-    const r=await fetch(url,{signal:c.signal,headers:{"User-Agent":"Mozilla/5.0"}});
-    clearTimeout(t); if(!r.ok) return null; return Buffer.from(await r.arrayBuffer());
-  } catch(e){clearTimeout(t);return null;}
-}
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+      ],
+    });
 
-// ── Parser BCRA (formato real 81 chars) ──────────────────────────────────────
-// Posiciones confirmadas empiricamente:
-// 00-10: CUIT librador (11)
-// 11-17: espacios
-// 18-28: banco(3) + fecha_presentacion AAAAMMDD (8) -- a veces con espacio inicial
-// 34-44: monto en centavos (11) -- longitud fija
-// 45-52: fecha rechazo AAAAMMDD (8) -- puede estar vacio (espacios)
-// 53-54: causal (2): SF=sin fondos, DF=defectos formales, DE=denunciado
-// 65-75: fecha pago DD/MM/AAAA o "IMPAGA" o espacios
-function parsearLinea(linea) {
-  const l = linea.padEnd(81);
-  const cuit = l.slice(0,11).trim();
-  if (!/^\d{11}$/.test(cuit)) return null;
+    const page = await browser.newPage();
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+    await page.setViewport({ width: 1280, height: 800 });
 
-  // Banco (3) + fecha presentacion AAAAMMDD (8) - buscar patron numerico
-  const zona    = l.slice(17,29);
-  const bcMatch = zona.match(/(\d{3})(\d{8})/);
-  const banco   = bcMatch ? bcMatch[1] : "---";
-  const fechaP  = bcMatch ? bcMatch[2] : "";
+    // ── Consultar deudas (situacion crediticia) ──
+    let deudaData = null;
+    try {
+      await page.goto(`https://www.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp?cuit=${cuit}`, {
+        waitUntil: "networkidle2", timeout: 30000
+      });
+      deudaData = await page.evaluate(() => {
+        const resultado = { nombre: "", periodos: [] };
+        // Nombre/razon social
+        const tds = document.querySelectorAll("td");
+        for (const td of tds) {
+          if (td.textContent.includes("Denominación") || td.textContent.includes("Denominacion")) {
+            resultado.nombre = td.nextElementSibling?.textContent?.trim() || "";
+            break;
+          }
+        }
+        // Tabla de deudas
+        const tablas = document.querySelectorAll("table");
+        for (const tabla of tablas) {
+          const filas = tabla.querySelectorAll("tr");
+          let periodoActual = "";
+          for (const fila of filas) {
+            const celdas = [...fila.querySelectorAll("td,th")].map(c => c.textContent.trim());
+            if (celdas.length === 0) continue;
+            // Detectar periodo (formato YYYYMM)
+            if (celdas[0] && /^\d{6}$/.test(celdas[0])) {
+              periodoActual = celdas[0];
+            }
+            // Fila con entidad y situacion
+            if (periodoActual && celdas.length >= 3 && celdas[2] && /^\d$/.test(celdas[2])) {
+              let periodo = resultado.periodos.find(p => p.periodo === periodoActual);
+              if (!periodo) { periodo = {periodo: periodoActual, entidades:[]}; resultado.periodos.push(periodo); }
+              periodo.entidades.push({
+                entidad: celdas[1] || "",
+                situacion: parseInt(celdas[2]),
+                monto: celdas[3] ? celdas[3].replace(/\./g,"").replace(",",".") : "0",
+              });
+            }
+          }
+        }
+        return resultado;
+      });
+    } catch(e) { console.error("Error scraping deudas:", e.message); }
 
-  // Monto fijo 11 chars pos 34-44 (centavos, Number() para evitar overflow de parseInt)
-  const montoRaw = l.slice(34,45).trim();
-  const monto    = /^\d+$/.test(montoRaw) ? Number(montoRaw)/100 : 0;
+    // ── Consultar cheques rechazados ──
+    let chequesData = null;
+    try {
+      await page.goto(`https://www.bcra.gob.ar/cheques/actualiza.asp`, {
+        waitUntil: "networkidle2", timeout: 30000
+      });
+      // Llenar el formulario con el CUIT
+      await page.waitForSelector("input[name='cuit'], input[type='text']", {timeout:10000});
+      const inputs = await page.$$("input[type='text'], input[name='cuit']");
+      if (inputs.length > 0) {
+        await inputs[0].click({clickCount:3});
+        await inputs[0].type(cuit);
+        // Buscar boton submit
+        const btns = await page.$$("input[type='submit'], button[type='submit'], button");
+        if (btns.length > 0) await btns[0].click();
+        await page.waitForNavigation({waitUntil:"networkidle2", timeout:15000}).catch(()=>{});
+      }
 
-  // Fecha rechazo pos 45-52 (8 chars)
-  const fechaRecRaw = l.slice(45,53).trim();
+      chequesData = await page.evaluate(() => {
+        const resultado = { cheques: [] };
+        const tablas = document.querySelectorAll("table");
+        for (const tabla of tablas) {
+          const filas = tabla.querySelectorAll("tr");
+          for (const fila of filas) {
+            const celdas = [...fila.querySelectorAll("td")].map(c => c.textContent.trim());
+            // Fila de cheque: nro, fecha, monto, causal, fechaPago
+            if (celdas.length >= 4 && celdas[0] && /^\d+$/.test(celdas[0].replace(/\D/g,""))) {
+              resultado.cheques.push({
+                nro:      celdas[0] || "",
+                fecha:    celdas[1] || "",
+                monto:    celdas[2] || "",
+                causal:   celdas[3] || "",
+                fechaPago:celdas[4] || "",
+                pagado:   celdas[4] && celdas[4].trim() !== "" && celdas[4].trim() !== "No Regularizado",
+              });
+            }
+          }
+        }
+        return resultado;
+      });
+    } catch(e) { console.error("Error scraping cheques:", e.message); }
 
-  // Causal pos 53-54
-  const causalRaw = l.slice(53,55).trim();
-  const CAUSALES  = {"SF":"SIN FONDOS","DF":"DEFECTOS FORMALES","DE":"DENUNCIADO"};
-  const causal    = CAUSALES[causalRaw] || (causalRaw||"SIN FONDOS");
+    return { deudaData, chequesData };
 
-  // Estado pago pos 65-76
-  const estado   = l.slice(65,76).trim();
-  const pagado   = /\d{2}\/\d{2}\/\d{4}/.test(estado) ? 1 : 0;
-  const fechaPago= pagado ? (estado.match(/\d{2}\/\d{2}\/\d{4}/)||[""])[0] : "";
-
-  return {
-    cuit,
-    banco,
-    fecha_pres: fmtFechaYMD(fechaP),
-    monto,
-    fecha_rec:  fmtFechaYMD(fechaRecRaw),
-    causal,
-    pagado,
-    fecha_pago: fechaPago,
-  };
-}
-
-function parsearArchivo(contenido) {
-  const lineas = contenido.split(/\r?\n/).filter(l=>l.trim());
-  if (!muestraDebug && lineas.length>0) {
-    muestraDebug = lineas.slice(0,3).map(l=>"len="+l.length+" | "+l.slice(0,80)).join("\n");
-    console.log("Debug:\n"+muestraDebug);
+  } finally {
+    if (browser) await browser.close().catch(()=>{});
   }
-  let altas=[], bajas=[], n=0;
-  for (const linea of lineas) {
-    const reg = parsearLinea(linea);
-    if (!reg) continue;
-    altas.push(reg);
-    if (reg.pagado) bajas.push(reg);
-    if (altas.length>=500) { batchIns(altas); n+=altas.length; altas=[]; }
-  }
-  if (altas.length) { batchIns(altas); n+=altas.length; }
-  if (bajas.length) batchPag(bajas);
-  return n;
 }
 
-async function procesarZip(fecha) {
-  const buf = await fetchZip(`https://www.bcra.gob.ar/archivos/zips/cheques/${fecha}.zip`);
-  if (!buf) return 0;
-  try {
-    const zip=new AdmZip(buf); let total=0;
-    for (const e of zip.getEntries()) {
-      if (!e.isDirectory) total += parsearArchivo(e.getData().toString("latin1"));
-    }
-    return total;
-  } catch(e) { console.error("ZIP error",fecha,e.message); return 0; }
-}
+// ── Armar mensaje ─────────────────────────────────────────────────────────────
+function armarMensaje(cuit, deudaData, chequesData) {
+  const fmt    = formatCuit(cuit);
+  const nombre = deudaData?.nombre || "";
+  const periodos= deudaData?.periodos || [];
+  const cheques = chequesData?.cheques || [];
+  const L = [];
 
-function fechas(dias) {
-  const res=[], hoy=new Date();
-  for(let i=0;i<dias;i++){
-    const d=new Date(hoy); d.setDate(hoy.getDate()-i);
-    res.push(`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`);
-  }
-  return res;
-}
+  const sinPagar = cheques.filter(c => !c.pagado);
+  const pagados  = cheques.filter(c => c.pagado);
+  const semaforo = sinPagar.length > 0 ? "🔴" : (pagados.length > 0 ? "🟡" : "🟢");
 
-async function cargaInicial() {
-  console.log(`Cargando ${DIAS} dias...`);
-  estadoBase="actualizando";
-  let arch=0,regs=0;
-  for (const f of fechas(DIAS)) {
-    const n=await procesarZip(f);
-    if(n>0){arch++;regs+=n;}
-  }
-  ultimaAct=new Date().toLocaleString("es-AR");
-  db.prepare(`INSERT OR REPLACE INTO meta VALUES('ultima_act',?)`).run(ultimaAct);
-  estadoBase="lista";
-  console.log(`Base lista: ${arch} arch, ${stmtCount.get().n} registros.`);
-}
-
-async function actualizarDiario() {
-  const hoy=new Date();
-  const f=`${hoy.getFullYear()}${String(hoy.getMonth()+1).padStart(2,"0")}${String(hoy.getDate()).padStart(2,"0")}`;
-  await procesarZip(f);
-  ultimaAct=new Date().toLocaleString("es-AR");
-  db.prepare(`INSERT OR REPLACE INTO meta VALUES('ultima_act',?)`).run(ultimaAct);
-}
-
-// ── Mensaje ───────────────────────────────────────────────────────────────────
-function sumarMonto(arr) { return arr.reduce((s,c)=>s+c.monto,0); }
-
-function armarMensaje(cuit, deudores, cheques) {
-  const fmt=formatCuit(cuit);
-  const nombre=deudores?.results?.denominacion||"";
-  const periodos=deudores?.results?.periodos||[];
-  const L=[];
-
-  const sinPagar = cheques.filter(c=>!c.pagado);
-  const pagados  = cheques.filter(c=>c.pagado);
-  const tieneRechazados = cheques.length > 0;
-
-  // Encabezado con semaforo
-  const semaforo = sinPagar.length>0 ? "🔴" : (pagados.length>0 ? "🟡" : "🟢");
-  L.push(semaforo+" CUIT: "+fmt);
-  if(nombre) L.push("👤 "+nombre);
+  L.push(semaforo + " CUIT: " + fmt);
+  if (nombre) L.push("👤 " + nombre);
   L.push("");
 
   // Situacion crediticia
-  if(periodos.length===0){
+  if (periodos.length === 0) {
     L.push("✅ Sin deudas en el sistema financiero.");
   } else {
-    let max=0;
-    periodos.forEach(p=>(p.entidades||[]).forEach(e=>{const s=parseInt(e.situacion);if(s>max)max=s;}));
-    const sit=SITS[max]||{emoji:"❓",label:"S"+max};
-    L.push("📊 Situacion crediticia: S"+max+" "+sit.emoji+" "+sit.label);
-    periodos.forEach(p=>{
+    let max = 0;
+    periodos.forEach(p => p.entidades.forEach(e => { if(e.situacion > max) max = e.situacion; }));
+    const sit = SITS[max] || {emoji:"❓", label:"S"+max};
+    L.push("📊 Situacion: S"+max+" "+sit.emoji+" "+sit.label);
+    periodos.forEach(p => {
       L.push("   Periodo "+p.periodo+":");
-      (p.entidades||[]).forEach(e=>{
-        const s=parseInt(e.situacion),sit=SITS[s]||{emoji:"❓",label:"S"+s};
-        let li="   "+sit.emoji+" S"+s+" "+sit.label+" — "+(e.entidad||"Entidad");
-        if(e.monto) li+=" ("+formatMonto(e.monto*1000)+")";
-        L.push(li);
+      p.entidades.forEach(e => {
+        const s = SITS[e.situacion] || {emoji:"❓", label:"S"+e.situacion};
+        L.push("   "+s.emoji+" S"+e.situacion+" "+s.label+" — "+e.entidad+
+          (e.monto && e.monto!=="0" ? " ($"+Number(e.monto).toLocaleString("es-AR")+")" : ""));
       });
     });
   }
@@ -239,153 +182,111 @@ function armarMensaje(cuit, deudores, cheques) {
   L.push("");
   L.push("━━━━━━━━━━━━━━━━━━━━━");
 
-  // Bloque cheques
-  if(!tieneRechazados){
+  if (cheques.length === 0) {
     L.push("🟢 SIN CHEQUES RECHAZADOS");
-    L.push("   (ultimos "+DIAS+" dias)");
   } else {
-    // Totales por causal
-    const sf  = cheques.filter(c=>c.causal.includes("FONDO"));
-    const df  = cheques.filter(c=>c.causal.includes("FORMAL")||c.causal.includes("DEFECTO"));
-    const den = cheques.filter(c=>c.causal.includes("DENUNCIA"));
-    const otros = cheques.filter(c=>!c.causal.includes("FONDO")&&!c.causal.includes("FORMAL")&&!c.causal.includes("DEFECTO")&&!c.causal.includes("DENUNCIA"));
+    // Agrupar por causal
+    const porCausal = {};
+    cheques.forEach(ch => {
+      const k = ch.causal || "SIN FONDOS";
+      if (!porCausal[k]) porCausal[k] = [];
+      porCausal[k].push(ch);
+    });
 
-    L.push("🔴 CHEQUES RECHAZADOS: "+cheques.length+"  ("+formatMonto(sumarMonto(cheques))+")");
+    L.push("🔴 CHEQUES RECHAZADOS: " + cheques.length);
     L.push("━━━━━━━━━━━━━━━━━━━━━");
-    if(sf.length>0)   L.push("  Sin fondos:      "+String(sf.length).padStart(3)+"  ("+formatMonto(sumarMonto(sf))+")");
-    if(df.length>0)   L.push("  Defecto formal:  "+String(df.length).padStart(3)+"  ("+formatMonto(sumarMonto(df))+")");
-    if(den.length>0)  L.push("  Denunciados:     "+String(den.length).padStart(3)+"  ("+formatMonto(sumarMonto(den))+")");
-    if(otros.length>0)L.push("  Otros:           "+String(otros.length).padStart(3)+"  ("+formatMonto(sumarMonto(otros))+")");
+    Object.entries(porCausal).forEach(([causal, arr]) => {
+      L.push("  "+causal+": "+arr.length);
+    });
     L.push("━━━━━━━━━━━━━━━━━━━━━");
-    L.push("  ❌ Sin pagar:     "+String(sinPagar.length).padStart(3)+"  ("+formatMonto(sumarMonto(sinPagar))+")");
-    L.push("  ✅ Pagados:       "+String(pagados.length).padStart(3)+"  ("+formatMonto(sumarMonto(pagados))+")");
+    L.push("  ❌ Sin pagar:  " + sinPagar.length);
+    L.push("  ✅ Pagados:    " + pagados.length);
 
-    // Detalle sin pagar
-    if(sinPagar.length>0){
+    if (sinPagar.length > 0) {
       L.push("");
-      L.push("❌ DETALLE SIN PAGAR:");
-      sinPagar
-        .sort((a,b)=>(b.fecha_pres||"").localeCompare(a.fecha_pres||""))
-        .slice(0,20)
-        .forEach(ch=>{
-          const fecha = ch.fecha_rec&&ch.fecha_rec!=="-" ? ch.fecha_rec : ch.fecha_pres;
-          L.push("  "+fecha+"  "+formatMonto(ch.monto)+"  "+ch.causal);
-        });
-      if(sinPagar.length>20) L.push("  ... y "+(sinPagar.length-20)+" mas");
+      L.push("❌ SIN PAGAR:");
+      sinPagar.slice(0, 20).forEach(ch => {
+        L.push("  Nro: "+ch.nro+"  Fecha: "+ch.fecha);
+        L.push("  Monto: "+ch.monto+"  "+ch.causal);
+      });
+      if (sinPagar.length > 20) L.push("  ... y "+(sinPagar.length-20)+" mas");
     }
 
-    // Detalle pagados
-    if(pagados.length>0){
+    if (pagados.length > 0) {
       L.push("");
-      L.push("✅ DETALLE PAGADOS:");
-      pagados
-        .sort((a,b)=>(b.fecha_pres||"").localeCompare(a.fecha_pres||""))
-        .slice(0,20)
-        .forEach(ch=>{
-          const fecha = ch.fecha_rec&&ch.fecha_rec!=="-" ? ch.fecha_rec : ch.fecha_pres;
-          L.push("  "+fecha+"  "+formatMonto(ch.monto)+"  pagado: "+(ch.fecha_pago||"-"));
-        });
-      if(pagados.length>20) L.push("  ... y "+(pagados.length-20)+" mas");
+      L.push("✅ PAGADOS:");
+      pagados.slice(0, 20).forEach(ch => {
+        L.push("  Nro: "+ch.nro+"  Fecha: "+ch.fecha);
+        L.push("  Monto: "+ch.monto+"  Pagado: "+ch.fechaPago);
+      });
+      if (pagados.length > 20) L.push("  ... y "+(pagados.length-20)+" mas");
     }
   }
 
   L.push("");
-  L.push("📅 Base: "+(ultimaAct||"-"));
+  L.push("📅 "+new Date().toLocaleString("es-AR"));
   return L.join("\n");
 }
 
-// ── Procesar ──────────────────────────────────────────────────────────────────
+// ── Procesar CUITs ────────────────────────────────────────────────────────────
 async function procesarCUITs(chatId, texto) {
-  if(estadoBase!=="lista")
-    return bot.sendMessage(chatId,"⏳ Base cargando (~5 min). Usa /estado para ver el progreso.");
-  const cuits=[...new Set(texto.split(/[\s,;|]+/).map(parseCuit).filter(c=>c.length===11))];
-  if(cuits.length===0){
-    if(/\d/.test(texto)) return bot.sendMessage(chatId,"⚠️ CUIT invalido. Ej: 20123456789");
+  const cuits = [...new Set(texto.split(/[\s,;|]+/).map(parseCuit).filter(c => c.length===11))];
+  if (cuits.length === 0) {
+    if (/\d/.test(texto)) return bot.sendMessage(chatId, "⚠️ CUIT invalido. Ej: 20123456789");
     return;
   }
-  if(cuits.length>10) return bot.sendMessage(chatId,"⚠️ Maximo 10 CUITs.");
-  const espera=await bot.sendMessage(chatId,
-    cuits.length===1?"🔍 Consultando "+formatCuit(cuits[0])+"...":"🔍 Consultando "+cuits.length+" CUITs..."
-  );
-  const resps=await Promise.all(cuits.map(async cuit=>{
+  if (cuits.length > 5) return bot.sendMessage(chatId, "⚠️ Maximo 5 CUITs por consulta.");
+
+  for (const cuit of cuits) {
+    const espera = await bot.sendMessage(chatId, "🔍 Consultando "+formatCuit(cuit)+"...");
     try {
-      const deudores=await fetchJSON("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/"+cuit);
-      return {cuit,deudores,cheques:stmtQuery.all(cuit),error:null};
-    } catch {return {cuit,error:"Error al consultar."};}
-  }));
-  try{await bot.deleteMessage(chatId,espera.message_id);}catch{}
-  for(const r of resps){
-    try{
-      await bot.sendMessage(chatId,
-        r.error?"❌ "+formatCuit(r.cuit)+"\n"+r.error:armarMensaje(r.cuit,r.deudores,r.cheques)
-      );
-    }catch(e){await bot.sendMessage(chatId,"❌ Error mostrando "+formatCuit(r.cuit));}
-    if(resps.length>1) await new Promise(r=>setTimeout(r,400));
+      const { deudaData, chequesData } = await scrapearBCRA(cuit);
+      try { await bot.deleteMessage(chatId, espera.message_id); } catch {}
+      await bot.sendMessage(chatId, armarMensaje(cuit, deudaData, chequesData));
+    } catch(e) {
+      try { await bot.deleteMessage(chatId, espera.message_id); } catch {}
+      console.error("Error scraping", cuit, e.message);
+      await bot.sendMessage(chatId, "❌ Error consultando "+formatCuit(cuit)+". Intenta de nuevo.");
+    }
+    if (cuits.length > 1) await new Promise(r => setTimeout(r, 1000));
   }
 }
 
 // ── Comandos ──────────────────────────────────────────────────────────────────
-bot.onText(/\/start/,msg=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+bot.onText(/\/start/, msg => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
     "👋 Hola "+msg.from.first_name+"!\n\n"+
-    "Consulto el Central de Deudores y cheques rechazados del BCRA.\n\n"+
-    "Manda un CUIT o varios separados por coma:\n20123456789\n20123456789, 27987654321\n\n"+
-    "/estado - Ver estado\n/ayuda - Ayuda"
+    "Consulto el BCRA directamente — Central de Deudores y cheques rechazados.\n\n"+
+    "Manda un CUIT:\n20123456789\n\n"+
+    "O varios separados por coma (max 5):\n20123456789, 27987654321\n\n"+
+    "/ayuda - Ayuda"
   );
 });
 
-bot.onText(/\/estado/,msg=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  const mem=Math.round(process.memoryUsage().heapUsed/1024/1024);
-  bot.sendMessage(msg.chat.id,
-    "📊 Estado:\n\nEstado: "+estadoBase+
-    "\nRegistros: "+stmtCount.get().n.toLocaleString("es-AR")+
-    "\nCUITs: "+stmtCuits.get().n.toLocaleString("es-AR")+
-    "\nRAM: "+mem+" MB"+
-    "\nUltima act.: "+(ultimaAct||"pendiente")+
-    "\nPeriodo: ultimos "+DIAS+" dias"
-  );
-});
-
-bot.onText(/\/debug/,msg=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  bot.sendMessage(msg.chat.id,"🔧 Muestra:\n\n"+(muestraDebug||"Sin datos."));
-});
-
-bot.onText(/\/resetdb/,async msg=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  if(estadoBase==="actualizando") return bot.sendMessage(msg.chat.id,"Ya actualizando...");
-  bot.sendMessage(msg.chat.id,"🗑 Limpiando y recargando base (~5 min)...");
-  db.exec("DELETE FROM cheques; DELETE FROM meta");
-  muestraDebug=null;
-  await cargaInicial();
-  bot.sendMessage(msg.chat.id,"✅ Base recargada. Usa /estado para verificar.");
-});
-
-bot.onText(/\/ayuda/,msg=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+bot.onText(/\/ayuda/, msg => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones:\n🟢S1 Normal\n🟡S2 Riesgo bajo\n🟠S3 Riesgo medio\n"+
     "🔴S4 Riesgo alto\n⛔S5 Irrecuperable\n🔵S6 Irrecup tecnica\n\n"+
-    "Cheques del BCRA actualizados cada dia a las 8 AM.\n\n"+
-    "/start /estado /resetdb /debug /ayuda"
+    "🟢 = Sin cheques rechazados\n"+
+    "🟡 = Cheques rechazados pero todos pagados\n"+
+    "🔴 = Tiene cheques sin pagar\n\n"+
+    "Los datos vienen directo del sitio del BCRA en tiempo real."
   );
 });
 
-bot.onText(/\/consultar (.+)/,async(msg,match)=>{
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  await procesarCUITs(msg.chat.id,match[1]);
+bot.onText(/\/consultar (.+)/, async (msg, match) => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+  await procesarCUITs(msg.chat.id, match[1]);
 });
 
-bot.on("message",async msg=>{
-  if(!msg.text||msg.text.startsWith("/")) return;
-  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  await procesarCUITs(msg.chat.id,msg.text);
+bot.on("message", async msg => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+  await procesarCUITs(msg.chat.id, msg.text);
 });
 
-bot.on("polling_error",err=>console.error("Polling:",err.message));
-cron.schedule("0 8 * * *",actualizarDiario,{timezone:"America/Argentina/Buenos_Aires"});
+bot.on("polling_error", err => console.error("Polling:", err.message));
 
-console.log("Bot BCRA v7 iniciando...");
-cargaInicial();
+console.log("Bot BCRA v8 (Puppeteer) iniciando...");
