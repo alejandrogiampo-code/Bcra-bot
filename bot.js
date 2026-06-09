@@ -26,10 +26,12 @@ const SITS = {
 };
 
 // ── Base en memoria ───────────────────────────────────────────────────────────
-let baseCheques = {};       // { cuit: [ {banco, fechaPres, monto, fechaRec, causal, pagado, fechaPago} ] }
+let baseCheques = {};
 let ultimaActualizacion = null;
 let estadoBase = "iniciando";
 let muestraDebug = null;
+// Cuantos dias cargar - 30 para no quedarse sin memoria en plan free
+const DIAS_HISTORICO = parseInt(process.env.DIAS_HISTORICO || "30");
 
 function parseCuit(v) { return v.replace(/\D/g, ""); }
 function formatCuit(c) {
@@ -67,17 +69,7 @@ async function fetchZip(url) {
   } catch(e) { clearTimeout(t); return null; }
 }
 
-// ── Parser del formato real del BCRA (81 chars por linea) ────────────────────
-// Formato detectado empiricamente:
-// 0-10:  CUIT (11)
-// 11-15: espacios (5)
-// 16-18: codigo banco (3)
-// 19-26: fecha presentacion al cobro AAAAMMDD (8)
-// 27:    espacio
-// 28-38: monto en centavos (11)
-// 39:    espacio
-// 40-49: si empieza con digito: fechaRechazo(8)+causal(2), si no: causal(2)+espacios
-// 50+:   estado multa o fecha de pago
+// ── Parser formato BCRA (81 chars) ───────────────────────────────────────────
 function parsearLinea(linea) {
   const l = linea.padEnd(81);
   const cuit = l.slice(0,11).trim();
@@ -89,7 +81,6 @@ function parsearLinea(linea) {
   const bloque   = l.slice(40,50).trim();
 
   let fechaRec, causal, extra;
-
   if (bloque && /^\d/.test(bloque) && bloque.length >= 8) {
     fechaRec = bloque.slice(0,8);
     causal   = bloque.slice(8,10).trim();
@@ -103,47 +94,34 @@ function parsearLinea(linea) {
   const monto = /^\d+$/.test(montoRaw) ? parseInt(montoRaw) / 100 : 0;
   const CAUSALES = {"SF":"SIN FONDOS","DF":"DEFECTOS FORMALES","DE":"DENUNCIADO"};
   const causalLabel = CAUSALES[causal] || (causal || "SIN FONDOS");
-
-  // Pagado si extra contiene fecha en formato dd/mm/aaaa o aaaammdd
-  const pagado = Boolean(extra && (/\d{2}\/\d{2}\/\d{4}/.test(extra) || /^\d{8}$/.test(extra)));
-  const fechaPago = pagado ? extra.match(/\d{2}\/\d{2}\/\d{4}/)?.[0] || extra : "";
+  const pagado = Boolean(extra && /\d{2}\/\d{2}\/\d{4}/.test(extra));
+  const fechaPago = pagado ? extra.match(/\d{2}\/\d{2}\/\d{4}/)?.[0] || "" : "";
   const estadoMulta = !pagado && extra ? extra : "";
 
-  return {
-    cuit, banco,
-    fechaPres: fmtFecha(fechaP),
-    monto,
-    fechaRec: fmtFecha(fechaRec),
-    causal: causalLabel,
-    pagado,
-    fechaPago,
-    estadoMulta,
-  };
+  return { cuit, banco, fechaPres:fmtFecha(fechaP), monto, fechaRec:fmtFecha(fechaRec),
+           causal:causalLabel, pagado, fechaPago, estadoMulta };
 }
 
 function parsearArchivo(contenido) {
   const lineas = contenido.split(/\r?\n/).filter(l => l.trim().length > 0);
   if (!muestraDebug && lineas.length > 0) {
     muestraDebug = lineas.slice(0,3).map(l => "len="+l.length+" | "+l.slice(0,80)).join("\n");
-    console.log("Debug muestra:\n" + muestraDebug);
   }
-
   let procesados = 0;
-  lineas.forEach(linea => {
+  for (const linea of lineas) {
     const reg = parsearLinea(linea);
-    if (!reg) return;
+    if (!reg) continue;
     const {cuit, ...datos} = reg;
     if (!baseCheques[cuit]) baseCheques[cuit] = [];
-    // Evitar duplicados: misma combinacion banco+fechaPres
-    const existe = baseCheques[cuit].find(c => c.banco===datos.banco && c.fechaPres===datos.fechaPres && c.monto===datos.monto);
+    const existe = baseCheques[cuit].find(c => c.banco===datos.banco && c.fechaPres===datos.fechaPres && Math.abs(c.monto-datos.monto)<0.01);
     if (!existe) {
       baseCheques[cuit].push(datos);
       procesados++;
     } else if (datos.pagado && !existe.pagado) {
-      // Actualizar si ahora esta pagado
-      Object.assign(existe, {pagado:true, fechaPago:datos.fechaPago});
+      existe.pagado = true;
+      existe.fechaPago = datos.fechaPago;
     }
-  });
+  }
   return procesados;
 }
 
@@ -154,11 +132,14 @@ async function procesarZip(fecha) {
   try {
     const zip = new AdmZip(buf);
     let total = 0;
-    zip.getEntries().forEach(entry => {
+    for (const entry of zip.getEntries()) {
       if (!entry.isDirectory) {
-        total += parsearArchivo(entry.getData().toString("latin1"));
+        const texto = entry.getData().toString("latin1");
+        total += parsearArchivo(texto);
+        // Liberar memoria explicitamente
+        entry.setData(Buffer.alloc(0));
       }
-    });
+    }
     return total;
   } catch(e) {
     console.error("Error ZIP", fecha, e.message);
@@ -180,17 +161,20 @@ function generarFechas(dias) {
 }
 
 async function cargaInicial() {
-  console.log("Cargando base (90 dias)...");
+  console.log(`Cargando base (${DIAS_HISTORICO} dias)...`);
   estadoBase = "actualizando";
-  const fechas = generarFechas(90);
+  const fechas = generarFechas(DIAS_HISTORICO);
   let archivos = 0, registros = 0;
   for (const f of fechas) {
     const n = await procesarZip(f);
     if (n > 0) { archivos++; registros += n; }
+    // Pausa pequeña entre archivos para no saturar memoria
+    await new Promise(r => setTimeout(r, 200));
   }
   ultimaActualizacion = new Date().toLocaleString("es-AR");
   estadoBase = "lista";
-  console.log(`Base lista: ${archivos} archivos, ${registros} registros, ${Object.keys(baseCheques).length} CUITs.`);
+  const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  console.log(`Base lista: ${archivos} archivos, ${registros} registros, ${Object.keys(baseCheques).length} CUITs, ${mem}MB RAM.`);
 }
 
 async function actualizarDiario() {
@@ -214,7 +198,6 @@ function armarMensaje(cuit, deudores, chequesLocal) {
   if (nombre) L.push("👤 " + nombre);
   L.push("");
 
-  // Situacion crediticia
   if (periodos.length === 0) {
     L.push("✅ Sin deudas en el sistema financiero.");
   } else {
@@ -241,26 +224,25 @@ function armarMensaje(cuit, deudores, chequesLocal) {
   const pagados  = chequesLocal.filter(c=>c.pagado);
 
   if (sinPagar.length > 0) {
-    L.push("🚨 Cheques rechazados SIN PAGAR: " + sinPagar.length);
-    // Ordenar por fecha mas reciente
+    L.push("🚨 Cheques sin pagar: " + sinPagar.length);
     sinPagar.sort((a,b)=>(b.fechaPres||"").localeCompare(a.fechaPres||"")).slice(0,15).forEach(ch=>{
       L.push("");
-      L.push("  Banco: " + ch.banco + "  |  " + ch.causal);
-      L.push("  Presentado: " + ch.fechaPres);
-      if (ch.fechaRec && ch.fechaRec !== "-") L.push("  Rechazado: " + ch.fechaRec);
-      L.push("  Monto: " + formatMonto(ch.monto));
-      if (ch.estadoMulta) L.push("  Multa: " + ch.estadoMulta);
+      L.push("  Banco: "+ch.banco+"  |  "+ch.causal);
+      L.push("  Presentado: "+ch.fechaPres);
+      if (ch.fechaRec && ch.fechaRec!=="-") L.push("  Rechazado: "+ch.fechaRec);
+      L.push("  Monto: "+formatMonto(ch.monto));
+      if (ch.estadoMulta) L.push("  Multa: "+ch.estadoMulta);
     });
     if (sinPagar.length > 15) L.push("  ... y "+(sinPagar.length-15)+" mas");
-    if (pagados.length > 0) L.push("\n✅ "+pagados.length+" cheque(s) ya pagado(s).");
+    if (pagados.length > 0) L.push("\n✅ "+pagados.length+" ya pagado(s).");
   } else if (pagados.length > 0) {
-    L.push("✅ Tenia "+pagados.length+" cheque(s) rechazado(s), todos ya pagados.");
+    L.push("✅ Tenia "+pagados.length+" cheque(s), todos ya pagados.");
   } else {
-    L.push("✅ Sin cheques rechazados (ultimos 90 dias).");
+    L.push("✅ Sin cheques rechazados (ultimos "+DIAS_HISTORICO+" dias).");
   }
 
   L.push("");
-  L.push("📅 Base: " + (ultimaActualizacion||"-"));
+  L.push("📅 Base: "+(ultimaActualizacion||"-"));
   return L.join("\n");
 }
 
@@ -268,7 +250,7 @@ function armarMensaje(cuit, deudores, chequesLocal) {
 async function procesarCUITs(chatId, texto) {
   if (estadoBase !== "lista") {
     return bot.sendMessage(chatId,
-      "⏳ La base se esta cargando (~3 min).\nUsa /estado para ver cuando esta lista."
+      "⏳ La base se esta cargando (~5 min la primera vez).\nUsa /estado para ver el progreso."
     );
   }
   const cuits = [...new Set(texto.split(/[\s,;|]+/).map(parseCuit).filter(c=>c.length===11))];
@@ -294,7 +276,8 @@ async function procesarCUITs(chatId, texto) {
   for (const r of resps) {
     try {
       await bot.sendMessage(chatId,
-        r.error ? "❌ "+formatCuit(r.cuit)+"\n"+r.error : armarMensaje(r.cuit, r.deudores, r.chequesLocal)
+        r.error ? "❌ "+formatCuit(r.cuit)+"\n"+r.error
+                : armarMensaje(r.cuit, r.deudores, r.chequesLocal)
       );
     } catch(e) {
       await bot.sendMessage(chatId, "❌ Error mostrando "+formatCuit(r.cuit));
@@ -319,20 +302,22 @@ bot.onText(/\/estado/, msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   const cuits = Object.keys(baseCheques).length;
   const total = Object.values(baseCheques).reduce((a,v)=>a+v.length,0);
+  const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
   bot.sendMessage(msg.chat.id,
-    "📊 Estado de la base:\n\n"+
+    "📊 Estado:\n\n"+
     "Estado: "+estadoBase+"\n"+
     "CUITs con cheques: "+cuits.toLocaleString("es-AR")+"\n"+
     "Total registros: "+total.toLocaleString("es-AR")+"\n"+
+    "RAM usada: "+mem+" MB\n"+
     "Ultima act.: "+(ultimaActualizacion||"pendiente")+"\n"+
-    "Periodo: ultimos 90 dias"
+    "Periodo: ultimos "+DIAS_HISTORICO+" dias"
   );
 });
 
 bot.onText(/\/debug/, msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
-    "🔧 Muestra de lineas BCRA:\n\n"+(muestraDebug||"Todavia no se proceso ningun archivo.")
+    "🔧 Muestra BCRA:\n\n"+(muestraDebug||"Sin datos aun.")
   );
 });
 
@@ -341,7 +326,7 @@ bot.onText(/\/ayuda/, msg=>{
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones:\n🟢S1 Normal\n🟡S2 Riesgo bajo\n🟠S3 Riesgo medio\n"+
     "🔴S4 Riesgo alto\n⛔S5 Irrecuperable\n🔵S6 Irrecup tecnica\n\n"+
-    "Cheques: base propia actualizada diariamente desde el BCRA.\n\n"+
+    "Cheques: base propia del BCRA, actualizada cada dia.\n\n"+
     "/start /estado /debug /ayuda"
   );
 });
@@ -361,5 +346,5 @@ bot.on("polling_error", err=>console.error("Polling error:", err.message));
 
 cron.schedule("0 8 * * *", actualizarDiario, {timezone:"America/Argentina/Buenos_Aires"});
 
-console.log("Bot BCRA v4 iniciando...");
+console.log("Bot BCRA v5 iniciando... ("+DIAS_HISTORICO+" dias, modo memoria reducida)");
 cargaInicial();
