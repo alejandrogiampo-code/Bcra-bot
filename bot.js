@@ -3,7 +3,6 @@ const puppeteer   = require("puppeteer");
 
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) { console.error("Falta BOT_TOKEN"); process.exit(1); }
-
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 const ALLOWED_USERS = process.env.ALLOWED_USERS
@@ -26,148 +25,133 @@ const SITS = {
 
 function lanzarBrowser() {
   return puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
-           "--disable-gpu","--no-zygote","--single-process"],
+    headless:"new",
+    args:["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+          "--disable-gpu","--no-zygote","--single-process"],
   });
 }
 
-// ── Scraping deudas ───────────────────────────────────────────────────────────
-async function scrapearDeudas(page, cuit) {
-  await page.goto(
-    `https://www.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp?cuit=${cuit}`,
-    {waitUntil:"networkidle2", timeout:30000}
-  );
-  return await page.evaluate(() => {
-    const res = {nombre:"", periodos:[]};
-    const texto = document.body.innerText;
-
-    // Nombre: buscar linea que siga a "Denominacion" o similar
-    const mNombre = texto.match(/Denominaci[oó]n[:\s]+([^\n]+)/i);
-    if (mNombre) res.nombre = mNombre[1].trim();
-
-    // Parsear tabla de situaciones
-    const filas = [...document.querySelectorAll("table tr")];
-    let periodoActual = null;
-    for (const fila of filas) {
-      const celdas = [...fila.querySelectorAll("td,th")].map(c=>c.innerText.trim());
-      if (!celdas.length) continue;
-      if (/^\d{6}$/.test(celdas[0])) {
-        periodoActual = celdas[0];
-      }
-      if (periodoActual && celdas.length>=3 && /^[1-6]$/.test(celdas[2])) {
-        let p = res.periodos.find(x=>x.periodo===periodoActual);
-        if (!p) { p={periodo:periodoActual,entidades:[]}; res.periodos.push(p); }
-        p.entidades.push({
-          entidad: celdas[1]||"",
-          situacion: parseInt(celdas[2]),
-          monto: (celdas[3]||"0").replace(/\./g,"").replace(",",".")
-        });
-      }
-    }
-    return res;
-  });
-}
-
-// ── Scraping cheques ──────────────────────────────────────────────────────────
-async function scrapearCheques(page, cuit) {
-  // Primero obtener el HTML del formulario para saber el nombre del campo
-  await page.goto("https://www.bcra.gob.ar/cheques/actualiza.asp",
-    {waitUntil:"networkidle2", timeout:30000}
-  );
-
-  // Guardar HTML para debug
-  const htmlForm = await page.evaluate(() => document.body.innerHTML.slice(0,3000));
-  console.log("HTML formulario cheques:", htmlForm.slice(0,1000));
-
-  // Buscar el input de CUIT por cualquier selector posible
-  const inputSelector = await page.evaluate(() => {
-    const inputs = [...document.querySelectorAll("input")];
-    for (const inp of inputs) {
-      if (inp.type==="text" || inp.type==="number" || inp.name?.toLowerCase().includes("cuit") || inp.id?.toLowerCase().includes("cuit")) {
-        return inp.name ? `input[name="${inp.name}"]` : (inp.id ? `#${inp.id}` : "input[type='text']");
-      }
-    }
-    return "input[type='text']";
-  });
-
-  console.log("Input selector:", inputSelector);
-
+async function consultarBCRA(cuit) {
+  const browser = await lanzarBrowser();
   try {
-    await page.waitForSelector(inputSelector, {timeout:8000});
-    await page.click(inputSelector, {clickCount:3});
-    await page.type(inputSelector, cuit, {delay:50});
+    const page = await browser.newPage();
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
+    await page.setViewport({width:1280, height:900});
 
-    // Submit
-    const submitted = await page.evaluate(() => {
-      const btn = document.querySelector("input[type='submit'],button[type='submit'],button");
-      if (btn) { btn.click(); return true; }
-      const form = document.querySelector("form");
-      if (form) { form.submit(); return true; }
-      return false;
+    // Una sola URL que tiene TODO: deudas + cheques rechazados
+    const url = `https://www2.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp?cuit=${cuit}`;
+    console.log("Consultando:", url);
+
+    await page.goto(url, {waitUntil:"networkidle2", timeout:40000});
+
+    // Extraer TODO el texto y tablas de la pagina
+    const datos = await page.evaluate(() => {
+      const resultado = {
+        nombre: "",
+        textoCompleto: document.body.innerText,
+        tablas: [],
+        periodos: [],
+        cheques: [],
+      };
+
+      // Nombre
+      const textoBody = document.body.innerText;
+      const mNombre = textoBody.match(/Denominaci[oó]n[:\s]+([^\n\r]+)/i);
+      if (mNombre) resultado.nombre = mNombre[1].trim();
+
+      // Extraer todas las tablas con sus datos
+      const tablas = document.querySelectorAll("table");
+      tablas.forEach((tabla, ti) => {
+        const filas = [];
+        tabla.querySelectorAll("tr").forEach(tr => {
+          const celdas = [...tr.querySelectorAll("td,th")].map(c => c.innerText.trim());
+          if (celdas.some(c => c)) filas.push(celdas);
+        });
+        if (filas.length > 0) resultado.tablas.push({indice: ti, filas});
+      });
+
+      return resultado;
     });
 
-    if (submitted) {
-      await page.waitForNavigation({waitUntil:"networkidle2", timeout:15000}).catch(()=>{});
-    }
-  } catch(e) {
-    console.error("Error llenando formulario:", e.message);
-    // Intentar URL directa
-    await page.goto(
-      `https://www.bcra.gob.ar/cheques/actualiza.asp?cuit=${cuit}`,
-      {waitUntil:"networkidle2", timeout:20000}
-    ).catch(()=>{});
+    console.log("Texto completo (primeros 2000):", datos.textoCompleto.slice(0,2000));
+    console.log("Tablas encontradas:", datos.tablas.length);
+    datos.tablas.forEach((t,i) => console.log(`Tabla ${i}:`, JSON.stringify(t.filas.slice(0,5))));
+
+    // Parsear periodos y cheques del texto
+    return parsearDatos(datos, cuit);
+
+  } finally {
+    await browser.close().catch(()=>{});
   }
+}
 
-  // Leer resultado
-  const html = await page.evaluate(() => document.body.innerHTML);
-  console.log("HTML resultado cheques (primeros 2000):", html.slice(0,2000));
+function parsearDatos(datos, cuit) {
+  const resultado = {nombre: datos.nombre, periodos: [], cheques: []};
 
-  return await page.evaluate(() => {
-    const res = {cheques:[], htmlDebug: document.body.innerText.slice(0,500)};
-    const filas = [...document.querySelectorAll("table tr")];
-    for (const fila of filas) {
-      const celdas = [...fila.querySelectorAll("td")].map(c=>c.innerText.trim());
-      if (celdas.length >= 4) {
-        // Detectar filas de cheques: primera celda es numero o fecha
-        const esCheque = /^\d+$/.test(celdas[0]) ||
-                         /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/.test(celdas[1]);
-        if (esCheque) {
-          const pagado = celdas.length>=5 &&
-                         celdas[4].trim()!=="" &&
-                         celdas[4].trim()!=="No Regularizado" &&
-                         celdas[4].trim()!=="NO REGULARIZADO";
-          res.cheques.push({
-            nro:       celdas[0]||"",
-            fecha:     celdas[1]||"",
-            monto:     celdas[2]||"",
-            causal:    celdas[3]||"",
-            fechaPago: celdas[4]||"",
+  // Parsear tablas para encontrar situacion crediticia y cheques
+  for (const tabla of datos.tablas) {
+    for (const fila of tabla.filas) {
+      // Detectar fila de situacion crediticia (tiene periodo YYYYMM, entidad, situacion 1-6)
+      if (fila.length >= 3 && /^\d{6}$/.test(fila[0]) && /^[1-6]$/.test(fila[2])) {
+        let p = resultado.periodos.find(x => x.periodo === fila[0]);
+        if (!p) { p = {periodo: fila[0], entidades: []}; resultado.periodos.push(p); }
+        p.entidades.push({
+          entidad: fila[1]||"",
+          situacion: parseInt(fila[2]),
+          monto: fila[3]||"",
+        });
+      }
+
+      // Detectar fila de cheque rechazado
+      // Columnas tipicas: Nro cheque | Fecha | Monto | Causal | Fecha pago / No Regularizado
+      if (fila.length >= 4) {
+        const posibleNro  = fila[0];
+        const posibleFecha= fila[1];
+        const posibleMonto= fila[2];
+        const posibleCausal=fila[3];
+
+        // Cheque si: primera col es numero, segunda es fecha dd/mm/aaaa
+        if (/^\d+$/.test(posibleNro.replace(/\D/g,"")) &&
+            /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(posibleFecha) &&
+            posibleCausal.length > 2) {
+
+          const fechaPago = fila[4]||"";
+          const pagado = fechaPago.trim() !== "" &&
+                         !fechaPago.toLowerCase().includes("no regul") &&
+                         !fechaPago.toLowerCase().includes("impaga");
+
+          resultado.cheques.push({
+            nro:       posibleNro,
+            fecha:     posibleFecha,
+            monto:     posibleMonto,
+            causal:    posibleCausal,
+            fechaPago: fechaPago,
             pagado,
           });
         }
       }
     }
-    return res;
-  });
+  }
+
+  return resultado;
 }
 
-// ── Armar mensaje ─────────────────────────────────────────────────────────────
-function armarMensaje(cuit, deudas, cheques) {
+function armarMensaje(cuit, datos) {
   const fmt    = formatCuit(cuit);
-  const nombre = deudas?.nombre || "";
-  const periodos= deudas?.periodos || [];
-  const lista  = cheques?.cheques || [];
+  const nombre = datos?.nombre || "";
+  const periodos= datos?.periodos || [];
+  const cheques = datos?.cheques || [];
   const L = [];
 
-  const sinPagar = lista.filter(c=>!c.pagado);
-  const pagados  = lista.filter(c=>c.pagado);
+  const sinPagar = cheques.filter(c=>!c.pagado);
+  const pagados  = cheques.filter(c=>c.pagado);
   const semaforo = sinPagar.length>0 ? "🔴" : (pagados.length>0 ? "🟡" : "🟢");
 
   L.push(semaforo+" CUIT: "+fmt);
   if (nombre) L.push("👤 "+nombre);
   L.push("");
 
+  // Situacion crediticia
   if (periodos.length===0) {
     L.push("✅ Sin deudas en el sistema financiero.");
   } else {
@@ -179,7 +163,7 @@ function armarMensaje(cuit, deudas, cheques) {
       L.push("   Periodo "+p.periodo+":");
       p.entidades.forEach(e=>{
         const s=SITS[e.situacion]||{emoji:"❓",label:"S"+e.situacion};
-        L.push("   "+s.emoji+" S"+e.situacion+" "+s.label+" — "+e.entidad);
+        L.push("   "+s.emoji+" S"+e.situacion+" "+s.label+" — "+e.entidad+(e.monto?" ("+e.monto+")":""));
       });
     });
   }
@@ -187,24 +171,20 @@ function armarMensaje(cuit, deudas, cheques) {
   L.push("");
   L.push("━━━━━━━━━━━━━━━━━━━━━");
 
-  if (lista.length===0) {
+  if (cheques.length===0) {
     L.push("🟢 SIN CHEQUES RECHAZADOS");
-    // Si hay debug text mostrarlo brevemente
-    if (cheques?.htmlDebug) {
-      const txt = cheques.htmlDebug.replace(/\s+/g," ").trim().slice(0,200);
-      if (txt) L.push("   ("+txt+")");
-    }
   } else {
+    // Agrupar por causal
     const porCausal = {};
-    lista.forEach(ch=>{
+    cheques.forEach(ch=>{
       const k=ch.causal||"SIN FONDOS";
-      if(!porCausal[k]) porCausal[k]=[];
-      porCausal[k].push(ch);
+      if(!porCausal[k]) porCausal[k]=0;
+      porCausal[k]++;
     });
 
-    L.push("🔴 CHEQUES RECHAZADOS: "+lista.length);
+    L.push("🔴 CHEQUES RECHAZADOS: "+cheques.length);
     L.push("━━━━━━━━━━━━━━━━━━━━━");
-    Object.entries(porCausal).forEach(([causal,arr])=>L.push("  "+causal+": "+arr.length));
+    Object.entries(porCausal).forEach(([c,n])=>L.push("  "+c+": "+n));
     L.push("━━━━━━━━━━━━━━━━━━━━━");
     L.push("  ❌ Sin pagar:  "+sinPagar.length);
     L.push("  ✅ Pagados:    "+pagados.length);
@@ -213,8 +193,8 @@ function armarMensaje(cuit, deudas, cheques) {
       L.push("");
       L.push("❌ SIN PAGAR:");
       sinPagar.slice(0,20).forEach(ch=>{
-        L.push("  Nro: "+ch.nro+"  Fecha: "+ch.fecha);
-        L.push("  Monto: "+ch.monto+"  "+ch.causal);
+        L.push("  N°"+ch.nro+"  "+ch.fecha+"  "+ch.monto);
+        L.push("  "+ch.causal);
       });
       if (sinPagar.length>20) L.push("  ... y "+(sinPagar.length-20)+" mas");
     }
@@ -222,8 +202,8 @@ function armarMensaje(cuit, deudas, cheques) {
       L.push("");
       L.push("✅ PAGADOS:");
       pagados.slice(0,20).forEach(ch=>{
-        L.push("  Nro: "+ch.nro+"  Fecha: "+ch.fecha);
-        L.push("  Monto: "+ch.monto+"  Pagado: "+ch.fechaPago);
+        L.push("  N°"+ch.nro+"  "+ch.fecha+"  "+ch.monto);
+        L.push("  Pagado: "+ch.fechaPago);
       });
       if (pagados.length>20) L.push("  ... y "+(pagados.length-20)+" mas");
     }
@@ -234,7 +214,6 @@ function armarMensaje(cuit, deudas, cheques) {
   return L.join("\n");
 }
 
-// ── Procesar ──────────────────────────────────────────────────────────────────
 async function procesarCUITs(chatId, texto) {
   const cuits=[...new Set(texto.split(/[\s,;|]+/).map(parseCuit).filter(c=>c.length===11))];
   if (cuits.length===0) {
@@ -245,29 +224,14 @@ async function procesarCUITs(chatId, texto) {
 
   for (const cuit of cuits) {
     const espera = await bot.sendMessage(chatId,"🔍 Consultando "+formatCuit(cuit)+"...");
-    let browser;
     try {
-      browser = await lanzarBrowser();
-      const page = await browser.newPage();
-      await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-
-      const [deudas, cheques] = await Promise.allSettled([
-        scrapearDeudas(page, cuit),
-        scrapearCheques(page, cuit),
-      ]);
-
+      const datos = await consultarBCRA(cuit);
       try { await bot.deleteMessage(chatId, espera.message_id); } catch {}
-      await bot.sendMessage(chatId, armarMensaje(
-        cuit,
-        deudas.status==="fulfilled" ? deudas.value : null,
-        cheques.status==="fulfilled" ? cheques.value : null,
-      ));
+      await bot.sendMessage(chatId, armarMensaje(cuit, datos));
     } catch(e) {
       try { await bot.deleteMessage(chatId, espera.message_id); } catch {}
       console.error("Error:", e.message);
       await bot.sendMessage(chatId,"❌ Error consultando "+formatCuit(cuit)+". Intenta de nuevo.");
-    } finally {
-      if (browser) await browser.close().catch(()=>{});
     }
     if (cuits.length>1) await new Promise(r=>setTimeout(r,2000));
   }
@@ -277,14 +241,14 @@ bot.onText(/\/start/,msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
     "👋 Hola "+msg.from.first_name+"!\n\nConsulto el BCRA en tiempo real.\n\n"+
-    "Manda un CUIT o varios (max 5) separados por coma.\n\n/ayuda - Ayuda"
+    "Manda un CUIT o varios (max 5) separados por coma:\n20123456789\n\n/ayuda"
   );
 });
 bot.onText(/\/ayuda/,msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
-    "🟢 Sin cheques rechazados\n🟡 Cheques pagados\n🔴 Cheques sin pagar\n\n"+
-    "Datos directo del sitio BCRA en tiempo real."
+    "🟢 Sin cheques rechazados\n🟡 Cheques pagados\n🔴 Tiene sin pagar\n\n"+
+    "Datos directo del BCRA en tiempo real."
   );
 });
 bot.onText(/\/consultar (.+)/,async(msg,match)=>{
@@ -298,4 +262,4 @@ bot.on("message",async msg=>{
 });
 bot.on("polling_error",err=>console.error("Polling:",err.message));
 
-console.log("Bot BCRA v9 (Puppeteer) iniciando...");
+console.log("Bot BCRA v10 iniciando...");
