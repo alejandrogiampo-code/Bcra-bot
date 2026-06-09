@@ -198,65 +198,94 @@ async function actualizarDiario() {
 }
 
 // ── Mensaje ───────────────────────────────────────────────────────────────────
+function sumarMonto(arr) { return arr.reduce((s,c)=>s+c.monto,0); }
+
 function armarMensaje(cuit, deudores, cheques) {
   const fmt=formatCuit(cuit);
   const nombre=deudores?.results?.denominacion||"";
   const periodos=deudores?.results?.periodos||[];
   const L=[];
 
-  L.push("🏦 CUIT: "+fmt);
+  const sinPagar = cheques.filter(c=>!c.pagado);
+  const pagados  = cheques.filter(c=>c.pagado);
+  const tieneRechazados = cheques.length > 0;
+
+  // Encabezado con semaforo
+  const semaforo = sinPagar.length>0 ? "🔴" : (pagados.length>0 ? "🟡" : "🟢");
+  L.push(semaforo+" CUIT: "+fmt);
   if(nombre) L.push("👤 "+nombre);
   L.push("");
 
+  // Situacion crediticia
   if(periodos.length===0){
     L.push("✅ Sin deudas en el sistema financiero.");
   } else {
     let max=0;
     periodos.forEach(p=>(p.entidades||[]).forEach(e=>{const s=parseInt(e.situacion);if(s>max)max=s;}));
     const sit=SITS[max]||{emoji:"❓",label:"S"+max};
-    L.push("📊 Situacion maxima: S"+max+" "+sit.emoji+" "+sit.label);
-    L.push("");
+    L.push("📊 Situacion crediticia: S"+max+" "+sit.emoji+" "+sit.label);
     periodos.forEach(p=>{
-      L.push("📅 Periodo: "+p.periodo);
+      L.push("   Periodo "+p.periodo+":");
       (p.entidades||[]).forEach(e=>{
         const s=parseInt(e.situacion),sit=SITS[s]||{emoji:"❓",label:"S"+s};
-        let li="  "+sit.emoji+" S"+s+" "+sit.label+" - "+(e.entidad||"Entidad");
-        if(e.monto) li+="  "+formatMonto(e.monto*1000);
+        let li="   "+sit.emoji+" S"+s+" "+sit.label+" — "+(e.entidad||"Entidad");
+        if(e.monto) li+=" ("+formatMonto(e.monto*1000)+")";
         L.push(li);
       });
-      L.push("");
     });
   }
 
-  L.push("─────────────────────");
+  L.push("");
+  L.push("━━━━━━━━━━━━━━━━━━━━━");
 
-  const sinPagar = cheques.filter(c=>!c.pagado);
-  const pagados  = cheques.filter(c=>c.pagado);
-
-  if(sinPagar.length>0){
-    L.push("🚨 Cheques sin pagar: "+sinPagar.length);
-    sinPagar.slice(0,15).forEach(ch=>{
-      L.push("");
-      L.push("  Banco: "+ch.banco+"  |  "+ch.causal);
-      L.push("  Presentado: "+ch.fecha_pres);
-      if(ch.fecha_rec&&ch.fecha_rec!=="-") L.push("  Rechazado: "+ch.fecha_rec);
-      L.push("  Monto: "+formatMonto(ch.monto));
-    });
-    if(sinPagar.length>15) L.push("  ... y "+(sinPagar.length-15)+" mas");
-    if(pagados.length>0) L.push("\n✅ "+pagados.length+" ya regularizado(s).");
-  } else if(pagados.length>0){
-    L.push("✅ Cheques ya regularizados: "+pagados.length);
-    pagados.slice(0,15).forEach(ch=>{
-      L.push("");
-      L.push("  Banco: "+ch.banco+"  |  "+ch.causal);
-      L.push("  Presentado: "+ch.fecha_pres);
-      if(ch.fecha_rec&&ch.fecha_rec!=="-") L.push("  Rechazado: "+ch.fecha_rec);
-      L.push("  Monto: "+formatMonto(ch.monto));
-      if(ch.fecha_pago) L.push("  ✅ Pagado: "+ch.fecha_pago);
-    });
-    if(pagados.length>15) L.push("  ... y "+(pagados.length-15)+" mas");
+  // Bloque cheques
+  if(!tieneRechazados){
+    L.push("🟢 SIN CHEQUES RECHAZADOS");
+    L.push("   (ultimos "+DIAS+" dias)");
   } else {
-    L.push("✅ Sin cheques rechazados (ultimos "+DIAS+" dias).");
+    // Totales por causal
+    const sf  = cheques.filter(c=>c.causal.includes("FONDO"));
+    const df  = cheques.filter(c=>c.causal.includes("FORMAL")||c.causal.includes("DEFECTO"));
+    const den = cheques.filter(c=>c.causal.includes("DENUNCIA"));
+    const otros = cheques.filter(c=>!c.causal.includes("FONDO")&&!c.causal.includes("FORMAL")&&!c.causal.includes("DEFECTO")&&!c.causal.includes("DENUNCIA"));
+
+    L.push("🔴 CHEQUES RECHAZADOS: "+cheques.length+"  ("+formatMonto(sumarMonto(cheques))+")");
+    L.push("━━━━━━━━━━━━━━━━━━━━━");
+    if(sf.length>0)   L.push("  Sin fondos:      "+String(sf.length).padStart(3)+"  ("+formatMonto(sumarMonto(sf))+")");
+    if(df.length>0)   L.push("  Defecto formal:  "+String(df.length).padStart(3)+"  ("+formatMonto(sumarMonto(df))+")");
+    if(den.length>0)  L.push("  Denunciados:     "+String(den.length).padStart(3)+"  ("+formatMonto(sumarMonto(den))+")");
+    if(otros.length>0)L.push("  Otros:           "+String(otros.length).padStart(3)+"  ("+formatMonto(sumarMonto(otros))+")");
+    L.push("━━━━━━━━━━━━━━━━━━━━━");
+    L.push("  ❌ Sin pagar:     "+String(sinPagar.length).padStart(3)+"  ("+formatMonto(sumarMonto(sinPagar))+")");
+    L.push("  ✅ Pagados:       "+String(pagados.length).padStart(3)+"  ("+formatMonto(sumarMonto(pagados))+")");
+
+    // Detalle sin pagar
+    if(sinPagar.length>0){
+      L.push("");
+      L.push("❌ DETALLE SIN PAGAR:");
+      sinPagar
+        .sort((a,b)=>(b.fecha_pres||"").localeCompare(a.fecha_pres||""))
+        .slice(0,20)
+        .forEach(ch=>{
+          const fecha = ch.fecha_rec&&ch.fecha_rec!=="-" ? ch.fecha_rec : ch.fecha_pres;
+          L.push("  "+fecha+"  "+formatMonto(ch.monto)+"  "+ch.causal);
+        });
+      if(sinPagar.length>20) L.push("  ... y "+(sinPagar.length-20)+" mas");
+    }
+
+    // Detalle pagados
+    if(pagados.length>0){
+      L.push("");
+      L.push("✅ DETALLE PAGADOS:");
+      pagados
+        .sort((a,b)=>(b.fecha_pres||"").localeCompare(a.fecha_pres||""))
+        .slice(0,20)
+        .forEach(ch=>{
+          const fecha = ch.fecha_rec&&ch.fecha_rec!=="-" ? ch.fecha_rec : ch.fecha_pres;
+          L.push("  "+fecha+"  "+formatMonto(ch.monto)+"  pagado: "+(ch.fecha_pago||"-"));
+        });
+      if(pagados.length>20) L.push("  ... y "+(pagados.length-20)+" mas");
+    }
   }
 
   L.push("");
