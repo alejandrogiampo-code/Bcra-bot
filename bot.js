@@ -1,29 +1,24 @@
 const TelegramBot = require("node-telegram-bot-api");
 
 const TOKEN = process.env.BOT_TOKEN;
-if (!TOKEN) {
-  console.error("Falta la variable BOT_TOKEN");
-  process.exit(1);
-}
+if (!TOKEN) { console.error("Falta BOT_TOKEN"); process.exit(1); }
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 const SITS = {
-  1: { emoji: "🟢", label: "Normal",            desc: "Cumplimiento normal" },
-  2: { emoji: "🟡", label: "Riesgo bajo",        desc: "Atraso 31-90 dias" },
-  3: { emoji: "🟠", label: "Riesgo medio",       desc: "Atraso 91-180 dias" },
-  4: { emoji: "🔴", label: "Riesgo alto",        desc: "Atraso 181-365 dias" },
-  5: { emoji: "⛔", label: "Irrecuperable",      desc: "Mas de 365 dias o quiebra" },
-  6: { emoji: "🔵", label: "Irrecup. Tecnica",   desc: "Irrecuperable tecnica" },
+  1: { emoji: "🟢", label: "Normal" },
+  2: { emoji: "🟡", label: "Riesgo bajo" },
+  3: { emoji: "🟠", label: "Riesgo medio" },
+  4: { emoji: "🔴", label: "Riesgo alto" },
+  5: { emoji: "⛔", label: "Irrecuperable" },
+  6: { emoji: "🔵", label: "Irrecup. Tecnica" },
 };
 
 function parseCuit(v) { return v.replace(/\D/g, ""); }
-
 function formatCuit(c) {
   if (c.length !== 11) return c;
   return c.slice(0,2) + "-" + c.slice(2,10) + "-" + c.slice(10);
 }
-
 function formatMonto(m) {
   return "$" + Number(m).toLocaleString("es-AR");
 }
@@ -47,18 +42,43 @@ async function fetchBCRA(url) {
 }
 
 async function consultarCUIT(cuit) {
-  const [deudores, cheques] = await Promise.all([
+  // Consultamos los 4 endpoints posibles en paralelo
+  const [deudores, chequesV1, chequesDeudor, chequesHistorico] = await Promise.all([
     fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/" + cuit),
     fetchBCRA("https://api.bcra.gob.ar/cheques/v1.0/deudores/" + cuit),
+    fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/" + cuit),
+    fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/Historicas/" + cuit),
   ]);
-  return { deudores, cheques };
+
+  // Unificar cheques de todos los endpoints
+  let todosLosCheques = [];
+
+  // Endpoint cheques v1
+  if (chequesV1?.results?.length > 0) {
+    todosLosCheques = todosLosCheques.concat(chequesV1.results);
+  }
+  // Endpoint cheques rechazados central deudores
+  if (chequesDeudor?.results?.length > 0) {
+    todosLosCheques = todosLosCheques.concat(chequesDeudor.results);
+  }
+  // A veces vienen en el historico
+  if (chequesHistorico?.results?.chequesRechazados?.length > 0) {
+    todosLosCheques = todosLosCheques.concat(chequesHistorico.results.chequesRechazados);
+  }
+
+  // Log para debug
+  console.log("CUIT:", cuit);
+  console.log("chequesV1:", JSON.stringify(chequesV1)?.slice(0, 200));
+  console.log("chequesDeudor:", JSON.stringify(chequesDeudor)?.slice(0, 200));
+  console.log("chequesHistorico:", JSON.stringify(chequesHistorico)?.slice(0, 200));
+
+  return { deudores, cheques: todosLosCheques, rawCheques: { chequesV1, chequesDeudor, chequesHistorico } };
 }
 
-function armarRespuesta(cuit, deudores, cheques) {
+function armarRespuesta(cuit, deudores, cheques, rawCheques) {
   const fmt = formatCuit(cuit);
   const nombre = deudores?.results?.denominacion || "";
   const periodos = deudores?.results?.periodos || [];
-  const chequesArr = cheques?.results || [];
 
   let lines = [];
 
@@ -66,6 +86,7 @@ function armarRespuesta(cuit, deudores, cheques) {
   if (nombre) lines.push("👤 " + nombre);
   lines.push("");
 
+  // Situacion crediticia
   if (periodos.length === 0) {
     lines.push("✅ Sin deudas en el sistema financiero.");
   } else {
@@ -93,31 +114,42 @@ function armarRespuesta(cuit, deudores, cheques) {
     });
   }
 
-  if (chequesArr.length > 0) {
-    lines.push("🏦 Cheques rechazados: " + chequesArr.length);
-    chequesArr.slice(0, 10).forEach(ch => {
+  lines.push("─────────────────────");
+
+  // Cheques rechazados
+  if (cheques.length > 0) {
+    lines.push("🏦 Cheques rechazados: " + cheques.length);
+    cheques.slice(0, 15).forEach(ch => {
       lines.push("");
-      lines.push("  Cheque N " + (ch.nroCheque || ch.numeroCheque || "-"));
-      if (ch.fechaRechazo || ch.fecha) lines.push("  Fecha: " + (ch.fechaRechazo || ch.fecha));
-      if (ch.entidad) lines.push("  Entidad: " + ch.entidad);
-      if (ch.monto) lines.push("  Monto: " + formatMonto(ch.monto));
-      if (ch.motivoRechazo) lines.push("  Motivo: " + ch.motivoRechazo);
+      // Intentar todos los nombres posibles de campos
+      const nro = ch.nroCheque || ch.numeroCheque || ch.numero || ch.nro || "-";
+      const fecha = ch.fechaRechazo || ch.fecha || ch.fechaProcesamiento || "";
+      const monto = ch.monto || ch.importe || null;
+      const motivo = ch.motivoRechazo || ch.motivo || ch.causal || "";
+      const entidad = ch.entidad || ch.banco || ch.nombreEntidad || "";
+      const cuenta = ch.cuenta || ch.nroCuenta || "";
+
+      lines.push("  Cheque N " + nro);
+      if (fecha) lines.push("  Fecha: " + fecha);
+      if (entidad) lines.push("  Entidad: " + entidad);
+      if (cuenta) lines.push("  Cuenta: " + cuenta);
+      if (monto) lines.push("  Monto: " + formatMonto(monto));
+      if (motivo) lines.push("  Motivo: " + motivo);
     });
-    if (chequesArr.length > 10) {
-      lines.push("  ... y " + (chequesArr.length - 10) + " mas");
+    if (cheques.length > 15) {
+      lines.push("");
+      lines.push("  ... y " + (cheques.length - 15) + " mas");
     }
   } else {
-    lines.push("✅ Sin cheques rechazados.");
+    lines.push("⚠️ Sin cheques rechazados en los registros del BCRA.");
+    lines.push("(Si tenes el detalle del rechazo, puede ser de una camara compensadora no reportada aun)");
   }
 
   return lines.join("\n");
 }
 
 async function procesarCUITs(chatId, texto) {
-  const cuits = texto
-    .split(/[\s,;|]+/)
-    .map(parseCuit)
-    .filter(c => c.length === 11);
+  const cuits = texto.split(/[\s,;|]+/).map(parseCuit).filter(c => c.length === 11);
 
   if (cuits.length === 0) {
     if (/\d/.test(texto)) {
@@ -127,10 +159,7 @@ async function procesarCUITs(chatId, texto) {
   }
 
   const unique = [...new Set(cuits)];
-
-  if (unique.length > 10) {
-    return bot.sendMessage(chatId, "⚠️ Maximo 10 CUITs por consulta.");
-  }
+  if (unique.length > 10) return bot.sendMessage(chatId, "⚠️ Maximo 10 CUITs por consulta.");
 
   const espera = await bot.sendMessage(chatId,
     unique.length === 1
@@ -141,8 +170,8 @@ async function procesarCUITs(chatId, texto) {
   const respuestas = await Promise.all(
     unique.map(async (cuit) => {
       try {
-        const { deudores, cheques } = await consultarCUIT(cuit);
-        return { cuit, deudores, cheques, error: null };
+        const { deudores, cheques, rawCheques } = await consultarCUIT(cuit);
+        return { cuit, deudores, cheques, rawCheques, error: null };
       } catch(e) {
         console.error("Error consultando", cuit, e.message);
         return { cuit, error: "No se pudo consultar. Intenta de nuevo." };
@@ -157,12 +186,12 @@ async function procesarCUITs(chatId, texto) {
       if (r.error) {
         await bot.sendMessage(chatId, "❌ CUIT " + formatCuit(r.cuit) + "\n" + r.error);
       } else {
-        const msg = armarRespuesta(r.cuit, r.deudores, r.cheques);
+        const msg = armarRespuesta(r.cuit, r.deudores, r.cheques, r.rawCheques);
         await bot.sendMessage(chatId, msg);
       }
     } catch(e) {
       console.error("Error enviando mensaje:", e.message);
-      await bot.sendMessage(chatId, "❌ Error al mostrar resultado del CUIT " + formatCuit(r.cuit));
+      await bot.sendMessage(chatId, "❌ Error mostrando resultado del CUIT " + formatCuit(r.cuit) + ". Error: " + e.message);
     }
     if (respuestas.length > 1) await new Promise(r => setTimeout(r, 400));
   }
@@ -173,13 +202,8 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
     "👋 Hola " + nombre + "!\n\n" +
     "Soy el bot de consulta del Central de Deudores del BCRA.\n\n" +
-    "Como usarme:\n" +
-    "Manda un CUIT para consultarlo\n" +
-    "O varios separados por espacio o coma\n\n" +
-    "Ejemplos:\n" +
-    "20123456789\n" +
-    "20-12345678-9\n" +
-    "20123456789, 27987654321\n\n" +
+    "Manda un CUIT para consultarlo, o varios separados por espacio o coma.\n\n" +
+    "Ejemplos:\n20123456789\n20-12345678-9\n20123456789, 27987654321\n\n" +
     "/ayuda para mas info"
   );
 });
@@ -187,16 +211,9 @@ bot.onText(/\/start/, (msg) => {
 bot.onText(/\/ayuda/, (msg) => {
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones crediticias:\n\n" +
-    "🟢 S1 - Normal (paga en termino)\n" +
-    "🟡 S2 - Riesgo bajo (31-90 dias de atraso)\n" +
-    "🟠 S3 - Riesgo medio (91-180 dias)\n" +
-    "🔴 S4 - Riesgo alto (181-365 dias)\n" +
-    "⛔ S5 - Irrecuperable (+365 dias o quiebra)\n" +
-    "🔵 S6 - Irrecuperable tecnica\n\n" +
-    "Comandos:\n" +
-    "/start - Inicio\n" +
-    "/consultar [cuit] - Consultar\n" +
-    "/ayuda - Esta ayuda"
+    "🟢 S1 - Normal\n🟡 S2 - Riesgo bajo (31-90 dias)\n🟠 S3 - Riesgo medio (91-180 dias)\n" +
+    "🔴 S4 - Riesgo alto (181-365 dias)\n⛔ S5 - Irrecuperable\n🔵 S6 - Irrecuperable tecnica\n\n" +
+    "Comandos: /start /ayuda /consultar [cuit]"
   );
 });
 
@@ -211,4 +228,4 @@ bot.on("message", async (msg) => {
 
 bot.on("polling_error", (err) => console.error("Polling error:", err.message));
 
-console.log("Bot BCRA iniciado y escuchando...");
+console.log("Bot BCRA iniciado...");
