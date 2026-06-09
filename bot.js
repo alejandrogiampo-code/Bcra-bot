@@ -20,7 +20,7 @@ function formatCuit(c) {
   return c.slice(0,2) + "-" + c.slice(2,10) + "-" + c.slice(10);
 }
 function formatMonto(m) {
-  return "$" + Number(m).toLocaleString("es-AR");
+  return "$" + Number(m).toLocaleString("es-AR", { minimumFractionDigits: 2 });
 }
 
 async function fetchBCRA(url) {
@@ -36,49 +36,25 @@ async function fetchBCRA(url) {
     return await res.json();
   } catch (e) {
     clearTimeout(timer);
-    console.error("fetchBCRA error:", url, e.message);
+    console.error("fetchBCRA error:", e.message, url);
     return null;
   }
 }
 
 async function consultarCUIT(cuit) {
-  // Consultamos los 4 endpoints posibles en paralelo
-  const [deudores, chequesV1, chequesDeudor, chequesHistorico] = await Promise.all([
+  const [deudores, cheques] = await Promise.all([
     fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/" + cuit),
-    fetchBCRA("https://api.bcra.gob.ar/cheques/v1.0/deudores/" + cuit),
     fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/ChequesRechazados/" + cuit),
-    fetchBCRA("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/Historicas/" + cuit),
   ]);
-
-  // Unificar cheques de todos los endpoints
-  let todosLosCheques = [];
-
-  // Endpoint cheques v1
-  if (chequesV1?.results?.length > 0) {
-    todosLosCheques = todosLosCheques.concat(chequesV1.results);
-  }
-  // Endpoint cheques rechazados central deudores
-  if (chequesDeudor?.results?.length > 0) {
-    todosLosCheques = todosLosCheques.concat(chequesDeudor.results);
-  }
-  // A veces vienen en el historico
-  if (chequesHistorico?.results?.chequesRechazados?.length > 0) {
-    todosLosCheques = todosLosCheques.concat(chequesHistorico.results.chequesRechazados);
-  }
-
-  // Log para debug
-  console.log("CUIT:", cuit);
-  console.log("chequesV1:", JSON.stringify(chequesV1)?.slice(0, 200));
-  console.log("chequesDeudor:", JSON.stringify(chequesDeudor)?.slice(0, 200));
-  console.log("chequesHistorico:", JSON.stringify(chequesHistorico)?.slice(0, 200));
-
-  return { deudores, cheques: todosLosCheques, rawCheques: { chequesV1, chequesDeudor, chequesHistorico } };
+  return { deudores, cheques };
 }
 
-function armarRespuesta(cuit, deudores, cheques, rawCheques) {
+function armarRespuesta(cuit, deudores, cheques) {
   const fmt = formatCuit(cuit);
-  const nombre = deudores?.results?.denominacion || "";
+  const nombre = deudores?.results?.denominacion || cheques?.results?.denominacion || "";
   const periodos = deudores?.results?.periodos || [];
+  // La estructura correcta es: results.causales[].entidades[].detalle[]
+  const causales = cheques?.results?.causales || [];
 
   let lines = [];
 
@@ -86,7 +62,7 @@ function armarRespuesta(cuit, deudores, cheques, rawCheques) {
   if (nombre) lines.push("👤 " + nombre);
   lines.push("");
 
-  // Situacion crediticia
+  // ── Situacion crediticia ──
   if (periodos.length === 0) {
     lines.push("✅ Sin deudas en el sistema financiero.");
   } else {
@@ -107,7 +83,7 @@ function armarRespuesta(cuit, deudores, cheques, rawCheques) {
         const s = parseInt(e.situacion);
         const sit = SITS[s] || { emoji: "❓", label: "S" + s };
         let linea = "  " + sit.emoji + " S" + s + " " + sit.label + " - " + (e.entidad || "Entidad");
-        if (e.monto) linea += "  " + formatMonto(e.monto);
+        if (e.monto) linea += "  " + formatMonto(e.monto * 1000); // viene en miles
         lines.push(linea);
       });
       lines.push("");
@@ -116,33 +92,35 @@ function armarRespuesta(cuit, deudores, cheques, rawCheques) {
 
   lines.push("─────────────────────");
 
-  // Cheques rechazados
-  if (cheques.length > 0) {
-    lines.push("🏦 Cheques rechazados: " + cheques.length);
-    cheques.slice(0, 15).forEach(ch => {
-      lines.push("");
-      // Intentar todos los nombres posibles de campos
-      const nro = ch.nroCheque || ch.numeroCheque || ch.numero || ch.nro || "-";
-      const fecha = ch.fechaRechazo || ch.fecha || ch.fechaProcesamiento || "";
-      const monto = ch.monto || ch.importe || null;
-      const motivo = ch.motivoRechazo || ch.motivo || ch.causal || "";
-      const entidad = ch.entidad || ch.banco || ch.nombreEntidad || "";
-      const cuenta = ch.cuenta || ch.nroCuenta || "";
+  // ── Cheques rechazados ──
+  // Estructura: causales[{ causal, entidades[{ entidad, detalle[{nroCheque, fechaRechazo, monto, fechaPago, estadoMulta, denomJuridica}] }] }]
+  if (causales.length > 0) {
+    let totalCheques = 0;
+    causales.forEach(c => c.entidades?.forEach(e => totalCheques += (e.detalle?.length || 0)));
 
-      lines.push("  Cheque N " + nro);
-      if (fecha) lines.push("  Fecha: " + fecha);
-      if (entidad) lines.push("  Entidad: " + entidad);
-      if (cuenta) lines.push("  Cuenta: " + cuenta);
-      if (monto) lines.push("  Monto: " + formatMonto(monto));
-      if (motivo) lines.push("  Motivo: " + motivo);
+    lines.push("🏦 Cheques rechazados: " + totalCheques);
+
+    causales.forEach(causalObj => {
+      const causal = causalObj.causal || "SIN FONDOS";
+      (causalObj.entidades || []).forEach(entObj => {
+        (entObj.detalle || []).forEach(ch => {
+          lines.push("");
+          lines.push("  Cheque N " + (ch.nroCheque || "-"));
+          lines.push("  Causal: " + causal);
+          if (ch.fechaRechazo) lines.push("  Fecha rechazo: " + ch.fechaRechazo);
+          if (ch.monto) lines.push("  Monto: " + formatMonto(ch.monto));
+          if (ch.denomJuridica) lines.push("  Empresa: " + ch.denomJuridica);
+          if (ch.fechaPago) {
+            lines.push("  Pagado: " + ch.fechaPago);
+          } else {
+            lines.push("  Estado: NO PAGADO");
+          }
+          if (ch.estadoMulta) lines.push("  Multa: " + ch.estadoMulta);
+        });
+      });
     });
-    if (cheques.length > 15) {
-      lines.push("");
-      lines.push("  ... y " + (cheques.length - 15) + " mas");
-    }
   } else {
-    lines.push("⚠️ Sin cheques rechazados en los registros del BCRA.");
-    lines.push("(Si tenes el detalle del rechazo, puede ser de una camara compensadora no reportada aun)");
+    lines.push("✅ Sin cheques rechazados en el BCRA.");
   }
 
   return lines.join("\n");
@@ -170,8 +148,8 @@ async function procesarCUITs(chatId, texto) {
   const respuestas = await Promise.all(
     unique.map(async (cuit) => {
       try {
-        const { deudores, cheques, rawCheques } = await consultarCUIT(cuit);
-        return { cuit, deudores, cheques, rawCheques, error: null };
+        const { deudores, cheques } = await consultarCUIT(cuit);
+        return { cuit, deudores, cheques, error: null };
       } catch(e) {
         console.error("Error consultando", cuit, e.message);
         return { cuit, error: "No se pudo consultar. Intenta de nuevo." };
@@ -186,12 +164,12 @@ async function procesarCUITs(chatId, texto) {
       if (r.error) {
         await bot.sendMessage(chatId, "❌ CUIT " + formatCuit(r.cuit) + "\n" + r.error);
       } else {
-        const msg = armarRespuesta(r.cuit, r.deudores, r.cheques, r.rawCheques);
+        const msg = armarRespuesta(r.cuit, r.deudores, r.cheques);
         await bot.sendMessage(chatId, msg);
       }
     } catch(e) {
       console.error("Error enviando mensaje:", e.message);
-      await bot.sendMessage(chatId, "❌ Error mostrando resultado del CUIT " + formatCuit(r.cuit) + ". Error: " + e.message);
+      await bot.sendMessage(chatId, "❌ Error al mostrar resultado de " + formatCuit(r.cuit));
     }
     if (respuestas.length > 1) await new Promise(r => setTimeout(r, 400));
   }
@@ -211,8 +189,12 @@ bot.onText(/\/start/, (msg) => {
 bot.onText(/\/ayuda/, (msg) => {
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones crediticias:\n\n" +
-    "🟢 S1 - Normal\n🟡 S2 - Riesgo bajo (31-90 dias)\n🟠 S3 - Riesgo medio (91-180 dias)\n" +
-    "🔴 S4 - Riesgo alto (181-365 dias)\n⛔ S5 - Irrecuperable\n🔵 S6 - Irrecuperable tecnica\n\n" +
+    "🟢 S1 - Normal\n" +
+    "🟡 S2 - Riesgo bajo (31-90 dias)\n" +
+    "🟠 S3 - Riesgo medio (91-180 dias)\n" +
+    "🔴 S4 - Riesgo alto (181-365 dias)\n" +
+    "⛔ S5 - Irrecuperable\n" +
+    "🔵 S6 - Irrecuperable tecnica\n\n" +
     "Comandos: /start /ayuda /consultar [cuit]"
   );
 });
