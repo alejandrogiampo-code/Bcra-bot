@@ -3,6 +3,25 @@ const TelegramBot = require("node-telegram-bot-api");
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) { console.error("Falta BOT_TOKEN"); process.exit(1); }
 
+// ── Lista blanca de usuarios autorizados ──────────────────────────────────────
+// Se carga desde la variable de entorno ALLOWED_USERS (IDs separados por coma)
+// Si la variable no está definida, el bot es abierto (para facilitar la configuración inicial)
+const ALLOWED_USERS = process.env.ALLOWED_USERS
+  ? new Set(process.env.ALLOWED_USERS.split(",").map(id => id.trim()))
+  : null;
+
+function usuarioAutorizado(msg) {
+  if (!ALLOWED_USERS) return true; // sin restricción si no se configuró
+  const userId = String(msg.from?.id);
+  return ALLOWED_USERS.has(userId);
+}
+
+function rechazarAcceso(chatId) {
+  bot.sendMessage(chatId,
+    "🔒 No tenes acceso a este bot.\nContacta al administrador."
+  );
+}
+
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 const SITS = {
@@ -120,7 +139,12 @@ function armarRespuesta(cuit, deudores, cheques) {
       });
     });
   } else {
-    lines.push("✅ Sin cheques rechazados en el BCRA.");
+    lines.push("⚠️ La API no devolvio cheques rechazados.");
+    lines.push("Si el cheque fue rechazado recientemente,");
+    lines.push("puede demorar unos dias en aparecer.");
+    lines.push("");
+    lines.push("Verificar manualmente:");
+    lines.push("https://www.bcra.gob.ar/cheques/actualiza.asp");
   }
 
   return lines.join("\n");
@@ -176,6 +200,7 @@ async function procesarCUITs(chatId, texto) {
 }
 
 bot.onText(/\/start/, (msg) => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   const nombre = msg.from.first_name || "amigo";
   bot.sendMessage(msg.chat.id,
     "👋 Hola " + nombre + "!\n\n" +
@@ -187,6 +212,7 @@ bot.onText(/\/start/, (msg) => {
 });
 
 bot.onText(/\/ayuda/, (msg) => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones crediticias:\n\n" +
     "🟢 S1 - Normal\n" +
@@ -199,12 +225,25 @@ bot.onText(/\/ayuda/, (msg) => {
   );
 });
 
+bot.onText(/\/cheques (.+)/, async (msg, match) => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+  const cuit = parseCuit(match[1]);
+  if (cuit.length !== 11) return bot.sendMessage(msg.chat.id, "⚠️ CUIT invalido.");
+  bot.sendMessage(msg.chat.id,
+    "🔗 Consulta directa en el BCRA para " + formatCuit(cuit) + ":\n" +
+    "https://www.bcra.gob.ar/cheques/actualiza.asp\n\n" +
+    "(Ingresa el CUIT en el campo de busqueda)"
+  );
+});
+
 bot.onText(/\/consultar (.+)/, async (msg, match) => {
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   await procesarCUITs(msg.chat.id, match[1]);
 });
 
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
+  if (!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   await procesarCUITs(msg.chat.id, msg.text);
 });
 
