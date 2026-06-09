@@ -1,13 +1,15 @@
 {
   "name": "bcra-bot",
-  "version": "1.0.0",
-  "description": "Bot de Telegram para consultar el Central de Deudores del BCRA",
+  "version": "2.0.0",
+  "description": "Bot de Telegram para consultar cheques rechazados y deudores del BCRA",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "adm-zip": "^0.5.10",
+    "node-cron": "^3.0.3"
   },
   "engines": {
     "node": ">=18"
