@@ -1,6 +1,8 @@
 const TelegramBot = require("node-telegram-bot-api");
 const AdmZip = require("adm-zip");
 const cron = require("node-cron");
+const Database = require("better-sqlite3");
+const path = require("path");
 
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) { console.error("Falta BOT_TOKEN"); process.exit(1); }
@@ -25,14 +27,52 @@ const SITS = {
   5:{emoji:"⛔",label:"Irrecuperable"},6:{emoji:"🔵",label:"Irrecup. Tecnica"},
 };
 
-// ── Base en memoria ───────────────────────────────────────────────────────────
-let baseCheques = {};
-let ultimaActualizacion = null;
-let estadoBase = "iniciando";
-let muestraDebug = null;
-// Cuantos dias cargar - 30 para no quedarse sin memoria en plan free
 const DIAS_HISTORICO = parseInt(process.env.DIAS_HISTORICO || "30");
 
+// ── Base de datos SQLite ──────────────────────────────────────────────────────
+const DB_PATH = process.env.DB_PATH || "/tmp/bcra.db";
+const db = new Database(DB_PATH);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS cheques (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cuit TEXT NOT NULL,
+    banco TEXT,
+    fecha_pres TEXT,
+    monto REAL,
+    fecha_rec TEXT,
+    causal TEXT,
+    pagado INTEGER DEFAULT 0,
+    fecha_pago TEXT,
+    estado_multa TEXT,
+    UNIQUE(cuit, banco, fecha_pres, monto)
+  );
+  CREATE INDEX IF NOT EXISTS idx_cuit ON cheques(cuit);
+  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+`);
+
+const stmtInsert = db.prepare(`
+  INSERT OR IGNORE INTO cheques (cuit, banco, fecha_pres, monto, fecha_rec, causal, pagado, fecha_pago, estado_multa)
+  VALUES (@cuit, @banco, @fecha_pres, @monto, @fecha_rec, @causal, @pagado, @fecha_pago, @estado_multa)
+`);
+const stmtPagar = db.prepare(`
+  UPDATE cheques SET pagado=1, fecha_pago=@fecha_pago WHERE cuit=@cuit AND banco=@banco AND fecha_pres=@fecha_pres AND ABS(monto-@monto)<0.01
+`);
+const stmtQuery = db.prepare(`SELECT * FROM cheques WHERE cuit=? ORDER BY fecha_pres DESC`);
+const stmtCount = db.prepare(`SELECT COUNT(*) as total FROM cheques`);
+const stmtCuits = db.prepare(`SELECT COUNT(DISTINCT cuit) as total FROM cheques`);
+const insertBatch = db.transaction((registros) => {
+  for (const r of registros) stmtInsert.run(r);
+});
+const pagarBatch = db.transaction((registros) => {
+  for (const r of registros) stmtPagar.run(r);
+});
+
+let ultimaActualizacion = db.prepare(`SELECT value FROM meta WHERE key='ultima_act'`).get()?.value || null;
+let estadoBase = "iniciando";
+let muestraDebug = null;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function parseCuit(v) { return v.replace(/\D/g, ""); }
 function formatCuit(c) {
   if (c.length !== 11) return c;
@@ -52,9 +92,7 @@ async function fetchJSON(url) {
   const t = setTimeout(()=>c.abort(), 15000);
   try {
     const r = await fetch(url, {signal:c.signal, headers:{Accept:"application/json","User-Agent":"Mozilla/5.0"}});
-    clearTimeout(t);
-    if (!r.ok) return null;
-    return await r.json();
+    clearTimeout(t); if (!r.ok) return null; return await r.json();
   } catch(e) { clearTimeout(t); return null; }
 }
 
@@ -63,8 +101,7 @@ async function fetchZip(url) {
   const t = setTimeout(()=>c.abort(), 30000);
   try {
     const r = await fetch(url, {signal:c.signal, headers:{"User-Agent":"Mozilla/5.0"}});
-    clearTimeout(t);
-    if (!r.ok) return null;
+    clearTimeout(t); if (!r.ok) return null;
     return Buffer.from(await r.arrayBuffer());
   } catch(e) { clearTimeout(t); return null; }
 }
@@ -95,33 +132,47 @@ function parsearLinea(linea) {
   const CAUSALES = {"SF":"SIN FONDOS","DF":"DEFECTOS FORMALES","DE":"DENUNCIADO"};
   const causalLabel = CAUSALES[causal] || (causal || "SIN FONDOS");
   const pagado = Boolean(extra && /\d{2}\/\d{2}\/\d{4}/.test(extra));
-  const fechaPago = pagado ? extra.match(/\d{2}\/\d{2}\/\d{4}/)?.[0] || "" : "";
-  const estadoMulta = !pagado && extra ? extra : "";
+  const fechaPago = pagado ? (extra.match(/\d{2}\/\d{2}\/\d{4}/)?.[0] || "") : "";
+  const estadoMulta = !pagado && extra ? extra.trim() : "";
 
-  return { cuit, banco, fechaPres:fmtFecha(fechaP), monto, fechaRec:fmtFecha(fechaRec),
-           causal:causalLabel, pagado, fechaPago, estadoMulta };
+  return {
+    cuit, banco,
+    fecha_pres: fmtFecha(fechaP),
+    monto,
+    fecha_rec: fmtFecha(fechaRec),
+    causal: causalLabel,
+    pagado: pagado ? 1 : 0,
+    fecha_pago: fechaPago,
+    estado_multa: estadoMulta,
+  };
 }
 
+// Procesa el contenido de un TXT línea por línea, en batches de 500
 function parsearArchivo(contenido) {
-  const lineas = contenido.split(/\r?\n/).filter(l => l.trim().length > 0);
-  if (!muestraDebug && lineas.length > 0) {
-    muestraDebug = lineas.slice(0,3).map(l => "len="+l.length+" | "+l.slice(0,80)).join("\n");
+  const lineas = contenido.split(/\r?\n/);
+  if (!muestraDebug) {
+    const muestra = lineas.filter(l=>l.trim()).slice(0,3);
+    muestraDebug = muestra.map(l=>"len="+l.length+" | "+l.slice(0,80)).join("\n");
+    console.log("Muestra:\n"+muestraDebug);
   }
-  let procesados = 0;
+
+  let altas = [], bajas = [], procesados = 0;
+
   for (const linea of lineas) {
+    if (!linea.trim()) continue;
     const reg = parsearLinea(linea);
     if (!reg) continue;
-    const {cuit, ...datos} = reg;
-    if (!baseCheques[cuit]) baseCheques[cuit] = [];
-    const existe = baseCheques[cuit].find(c => c.banco===datos.banco && c.fechaPres===datos.fechaPres && Math.abs(c.monto-datos.monto)<0.01);
-    if (!existe) {
-      baseCheques[cuit].push(datos);
-      procesados++;
-    } else if (datos.pagado && !existe.pagado) {
-      existe.pagado = true;
-      existe.fechaPago = datos.fechaPago;
+    altas.push(reg);
+    if (reg.pagado) bajas.push(reg);
+    if (altas.length >= 500) {
+      procesados += altas.length;
+      insertBatch(altas);
+      altas = [];
     }
   }
+  if (altas.length > 0) { procesados += altas.length; insertBatch(altas); }
+  if (bajas.length > 0) pagarBatch(bajas);
+
   return procesados;
 }
 
@@ -134,10 +185,7 @@ async function procesarZip(fecha) {
     let total = 0;
     for (const entry of zip.getEntries()) {
       if (!entry.isDirectory) {
-        const texto = entry.getData().toString("latin1");
-        total += parsearArchivo(texto);
-        // Liberar memoria explicitamente
-        entry.setData(Buffer.alloc(0));
+        total += parsearArchivo(entry.getData().toString("latin1"));
       }
     }
     return total;
@@ -152,7 +200,7 @@ function generarFechas(dias) {
   const hoy = new Date();
   for (let i = 0; i < dias; i++) {
     const d = new Date(hoy);
-    d.setDate(hoy.getDate() - i);
+    d.setDate(hoy.getDate()-i);
     const dd = String(d.getDate()).padStart(2,"0");
     const mm = String(d.getMonth()+1).padStart(2,"0");
     res.push(`${d.getFullYear()}${mm}${dd}`);
@@ -161,34 +209,33 @@ function generarFechas(dias) {
 }
 
 async function cargaInicial() {
-  console.log(`Cargando base (${DIAS_HISTORICO} dias)...`);
+  console.log(`Cargando base (${DIAS_HISTORICO} dias) en SQLite...`);
   estadoBase = "actualizando";
   const fechas = generarFechas(DIAS_HISTORICO);
   let archivos = 0, registros = 0;
   for (const f of fechas) {
     const n = await procesarZip(f);
     if (n > 0) { archivos++; registros += n; }
-    // Pausa pequeña entre archivos para no saturar memoria
-    await new Promise(r => setTimeout(r, 200));
   }
   ultimaActualizacion = new Date().toLocaleString("es-AR");
+  db.prepare(`INSERT OR REPLACE INTO meta VALUES ('ultima_act', ?)`).run(ultimaActualizacion);
   estadoBase = "lista";
-  const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-  console.log(`Base lista: ${archivos} archivos, ${registros} registros, ${Object.keys(baseCheques).length} CUITs, ${mem}MB RAM.`);
+  const total = stmtCount.get().total;
+  console.log(`Base lista: ${archivos} archivos, ${total} registros en DB.`);
 }
 
 async function actualizarDiario() {
   const hoy = new Date();
   const dd = String(hoy.getDate()).padStart(2,"0");
   const mm = String(hoy.getMonth()+1).padStart(2,"0");
-  const fecha = `${hoy.getFullYear()}${mm}${dd}`;
-  const n = await procesarZip(fecha);
+  const n = await procesarZip(`${hoy.getFullYear()}${mm}${dd}`);
   ultimaActualizacion = new Date().toLocaleString("es-AR");
-  console.log(`Actualizacion diaria ${fecha}: ${n} registros`);
+  db.prepare(`INSERT OR REPLACE INTO meta VALUES ('ultima_act', ?)`).run(ultimaActualizacion);
+  console.log(`Actualizacion diaria: ${n} registros`);
 }
 
 // ── Armar mensaje ─────────────────────────────────────────────────────────────
-function armarMensaje(cuit, deudores, chequesLocal) {
+function armarMensaje(cuit, deudores, cheques) {
   const fmt = formatCuit(cuit);
   const nombre = deudores?.results?.denominacion || "";
   const periodos = deudores?.results?.periodos || [];
@@ -220,22 +267,22 @@ function armarMensaje(cuit, deudores, chequesLocal) {
 
   L.push("─────────────────────");
 
-  const sinPagar = chequesLocal.filter(c=>!c.pagado);
-  const pagados  = chequesLocal.filter(c=>c.pagado);
+  const sinPagar = cheques.filter(c=>!c.pagado);
+  const pagados  = cheques.filter(c=>c.pagado);
 
   if (sinPagar.length > 0) {
     L.push("🚨 Cheques sin pagar: " + sinPagar.length);
-    sinPagar.sort((a,b)=>(b.fechaPres||"").localeCompare(a.fechaPres||"")).slice(0,15).forEach(ch=>{
+    sinPagar.slice(0,15).forEach(ch=>{
       L.push("");
       L.push("  Banco: "+ch.banco+"  |  "+ch.causal);
-      L.push("  Presentado: "+ch.fechaPres);
-      if (ch.fechaRec && ch.fechaRec!=="-") L.push("  Rechazado: "+ch.fechaRec);
+      L.push("  Presentado: "+ch.fecha_pres);
+      if (ch.fecha_rec && ch.fecha_rec!=="-") L.push("  Rechazado: "+ch.fecha_rec);
       L.push("  Monto: "+formatMonto(ch.monto));
-      if (ch.estadoMulta) L.push("  Multa: "+ch.estadoMulta);
+      if (ch.estado_multa) L.push("  Multa: "+ch.estado_multa);
     });
-    if (sinPagar.length > 15) L.push("  ... y "+(sinPagar.length-15)+" mas");
-    if (pagados.length > 0) L.push("\n✅ "+pagados.length+" ya pagado(s).");
-  } else if (pagados.length > 0) {
+    if (sinPagar.length>15) L.push("  ... y "+(sinPagar.length-15)+" mas");
+    if (pagados.length>0) L.push("\n✅ "+pagados.length+" ya pagado(s).");
+  } else if (pagados.length>0) {
     L.push("✅ Tenia "+pagados.length+" cheque(s), todos ya pagados.");
   } else {
     L.push("✅ Sin cheques rechazados (ultimos "+DIAS_HISTORICO+" dias).");
@@ -250,15 +297,15 @@ function armarMensaje(cuit, deudores, chequesLocal) {
 async function procesarCUITs(chatId, texto) {
   if (estadoBase !== "lista") {
     return bot.sendMessage(chatId,
-      "⏳ La base se esta cargando (~5 min la primera vez).\nUsa /estado para ver el progreso."
+      "⏳ La base se esta cargando (~5 min).\nUsa /estado para ver el progreso."
     );
   }
   const cuits = [...new Set(texto.split(/[\s,;|]+/).map(parseCuit).filter(c=>c.length===11))];
-  if (cuits.length === 0) {
+  if (cuits.length===0) {
     if (/\d/.test(texto)) return bot.sendMessage(chatId,"⚠️ CUIT invalido. Ej: 20123456789");
     return;
   }
-  if (cuits.length > 10) return bot.sendMessage(chatId,"⚠️ Maximo 10 CUITs.");
+  if (cuits.length>10) return bot.sendMessage(chatId,"⚠️ Maximo 10 CUITs.");
 
   const espera = await bot.sendMessage(chatId,
     cuits.length===1 ? "🔍 Consultando "+formatCuit(cuits[0])+"..." : "🔍 Consultando "+cuits.length+" CUITs..."
@@ -267,7 +314,8 @@ async function procesarCUITs(chatId, texto) {
   const resps = await Promise.all(cuits.map(async cuit => {
     try {
       const deudores = await fetchJSON("https://api.bcra.gob.ar/centraldedeudores/v1.0/Deudas/"+cuit);
-      return {cuit, deudores, chequesLocal: baseCheques[cuit]||[], error:null};
+      const cheques = stmtQuery.all(cuit);
+      return {cuit, deudores, cheques, error:null};
     } catch { return {cuit, error:"Error al consultar."}; }
   }));
 
@@ -277,12 +325,12 @@ async function procesarCUITs(chatId, texto) {
     try {
       await bot.sendMessage(chatId,
         r.error ? "❌ "+formatCuit(r.cuit)+"\n"+r.error
-                : armarMensaje(r.cuit, r.deudores, r.chequesLocal)
+                : armarMensaje(r.cuit, r.deudores, r.cheques)
       );
     } catch(e) {
-      await bot.sendMessage(chatId, "❌ Error mostrando "+formatCuit(r.cuit));
+      await bot.sendMessage(chatId,"❌ Error mostrando "+formatCuit(r.cuit));
     }
-    if (resps.length > 1) await new Promise(r=>setTimeout(r,400));
+    if (resps.length>1) await new Promise(r=>setTimeout(r,400));
   }
 }
 
@@ -292,33 +340,29 @@ bot.onText(/\/start/, msg=>{
   bot.sendMessage(msg.chat.id,
     "👋 Hola "+msg.from.first_name+"!\n\n"+
     "Consulto el Central de Deudores y cheques rechazados del BCRA.\n\n"+
-    "Manda un CUIT o varios separados por coma:\n"+
-    "20123456789\n20123456789, 27987654321\n\n"+
-    "/estado - Ver estado de la base\n/ayuda - Ayuda"
+    "Manda un CUIT o varios separados por coma:\n20123456789\n20123456789, 27987654321\n\n"+
+    "/estado - Ver estado\n/ayuda - Ayuda"
   );
 });
 
 bot.onText(/\/estado/, msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  const cuits = Object.keys(baseCheques).length;
-  const total = Object.values(baseCheques).reduce((a,v)=>a+v.length,0);
-  const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  const total = stmtCount.get().total;
+  const cuits = stmtCuits.get().total;
+  const mem = Math.round(process.memoryUsage().heapUsed/1024/1024);
   bot.sendMessage(msg.chat.id,
-    "📊 Estado:\n\n"+
-    "Estado: "+estadoBase+"\n"+
-    "CUITs con cheques: "+cuits.toLocaleString("es-AR")+"\n"+
-    "Total registros: "+total.toLocaleString("es-AR")+"\n"+
-    "RAM usada: "+mem+" MB\n"+
-    "Ultima act.: "+(ultimaActualizacion||"pendiente")+"\n"+
-    "Periodo: ultimos "+DIAS_HISTORICO+" dias"
+    "📊 Estado:\n\nEstado: "+estadoBase+
+    "\nRegistros en DB: "+total.toLocaleString("es-AR")+
+    "\nCUITs con cheques: "+cuits.toLocaleString("es-AR")+
+    "\nRAM usada: "+mem+" MB"+
+    "\nUltima act.: "+(ultimaActualizacion||"pendiente")+
+    "\nPeriodo: ultimos "+DIAS_HISTORICO+" dias"
   );
 });
 
 bot.onText(/\/debug/, msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
-  bot.sendMessage(msg.chat.id,
-    "🔧 Muestra BCRA:\n\n"+(muestraDebug||"Sin datos aun.")
-  );
+  bot.sendMessage(msg.chat.id,"🔧 Muestra:\n\n"+(muestraDebug||"Sin datos aun."));
 });
 
 bot.onText(/\/ayuda/, msg=>{
@@ -326,7 +370,7 @@ bot.onText(/\/ayuda/, msg=>{
   bot.sendMessage(msg.chat.id,
     "📖 Situaciones:\n🟢S1 Normal\n🟡S2 Riesgo bajo\n🟠S3 Riesgo medio\n"+
     "🔴S4 Riesgo alto\n⛔S5 Irrecuperable\n🔵S6 Irrecup tecnica\n\n"+
-    "Cheques: base propia del BCRA, actualizada cada dia.\n\n"+
+    "Cheques: base propia del BCRA, actualizada cada dia a las 8 AM.\n\n"+
     "/start /estado /debug /ayuda"
   );
 });
@@ -343,8 +387,7 @@ bot.on("message", async msg=>{
 });
 
 bot.on("polling_error", err=>console.error("Polling error:", err.message));
-
 cron.schedule("0 8 * * *", actualizarDiario, {timezone:"America/Argentina/Buenos_Aires"});
 
-console.log("Bot BCRA v5 iniciando... ("+DIAS_HISTORICO+" dias, modo memoria reducida)");
+console.log("Bot BCRA v6 (SQLite) iniciando...");
 cargaInicial();
