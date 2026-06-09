@@ -283,7 +283,16 @@ function armarMensaje(cuit, deudores, cheques) {
     if (sinPagar.length>15) L.push("  ... y "+(sinPagar.length-15)+" mas");
     if (pagados.length>0) L.push("\n✅ "+pagados.length+" ya pagado(s).");
   } else if (pagados.length>0) {
-    L.push("✅ Tenia "+pagados.length+" cheque(s), todos ya pagados.");
+    L.push("✅ Cheques ya regularizados: " + pagados.length);
+    pagados.slice(0,15).forEach(ch=>{
+      L.push("");
+      L.push("  Banco: "+ch.banco+"  |  "+ch.causal);
+      L.push("  Presentado: "+ch.fecha_pres);
+      if (ch.fecha_rec && ch.fecha_rec!=="-") L.push("  Rechazado: "+ch.fecha_rec);
+      L.push("  Monto: "+formatMonto(ch.monto));
+      if (ch.fecha_pago) L.push("  ✅ Pagado: "+ch.fecha_pago);
+    });
+    if (pagados.length>15) L.push("  ... y "+(pagados.length-15)+" mas");
   } else {
     L.push("✅ Sin cheques rechazados (ultimos "+DIAS_HISTORICO+" dias).");
   }
@@ -363,6 +372,16 @@ bot.onText(/\/estado/, msg=>{
 bot.onText(/\/debug/, msg=>{
   if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
   bot.sendMessage(msg.chat.id,"🔧 Muestra:\n\n"+(muestraDebug||"Sin datos aun."));
+});
+
+bot.onText(/\/resetdb/, async msg=>{
+  if(!usuarioAutorizado(msg)) return rechazarAcceso(msg.chat.id);
+  if(estadoBase==="actualizando") return bot.sendMessage(msg.chat.id,"Ya esta actualizando...");
+  bot.sendMessage(msg.chat.id,"🗑 Limpiando base y recargando desde cero (~5 min)...");
+  db.exec("DELETE FROM cheques; DELETE FROM meta");
+  muestraDebug = null;
+  await cargaInicial();
+  bot.sendMessage(msg.chat.id,"✅ Base recargada correctamente.");
 });
 
 bot.onText(/\/ayuda/, msg=>{
