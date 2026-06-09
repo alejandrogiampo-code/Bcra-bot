@@ -101,14 +101,15 @@ function parsearLinea(linea) {
   const cuit = l.slice(0,11).trim();
   if (!/^\d{11}$/.test(cuit)) return null;
 
-  // Banco + fecha presentacion (pos 18-28, 11 chars)
-  const bc_raw   = l.slice(18,29).trim();
-  const banco    = bc_raw.slice(0,3).replace(/\D/g,"").padStart(3,"0") || "---";
-  const fechaP   = bc_raw.slice(3).trim();
+  // Banco (3) + fecha presentacion AAAAMMDD (8) - buscar patron numerico
+  const zona    = l.slice(17,29);
+  const bcMatch = zona.match(/(\d{3})(\d{8})/);
+  const banco   = bcMatch ? bcMatch[1] : "---";
+  const fechaP  = bcMatch ? bcMatch[2] : "";
 
-  // Monto fijo 11 chars pos 34-44
+  // Monto fijo 11 chars pos 34-44 (centavos, Number() para evitar overflow de parseInt)
   const montoRaw = l.slice(34,45).trim();
-  const monto    = /^\d+$/.test(montoRaw) ? parseInt(montoRaw)/100 : 0;
+  const monto    = /^\d+$/.test(montoRaw) ? Number(montoRaw)/100 : 0;
 
   // Fecha rechazo pos 45-52 (8 chars)
   const fechaRecRaw = l.slice(45,53).trim();
